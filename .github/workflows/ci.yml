@@ -23,13 +23,17 @@ jobs:
       - run: sudo apt-get install -y -q nftables
       - run: sudo bin/hide check-rules
 
-  # The package names on each family, with the obfs4 bridge program.
+  # The package names on each family, with the obfs4 bridge program (Arch: AUR only, so not here).
   packages:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        image: [debian:stable, ubuntu:24.04, fedora:latest, archlinux:latest, opensuse/tumbleweed]
+        image: [debian:stable, ubuntu:24.04, fedora:latest, opensuse/tumbleweed]
+        bridges: [obfs4]
+        include:
+          - image: archlinux:latest
+            bridges: "off"
     container: ${{ matrix.image }}
     defaults:
       run:
@@ -39,12 +43,12 @@ jobs:
       - name: refresh Arch first (setup.sh asks you to)
         if: startsWith(matrix.image, 'archlinux')
         run: pacman -Syu --noconfirm
-      - run: bash ./setup.sh deps --bridges obfs4
+      - run: bash ./setup.sh deps --bridges ${{ matrix.bridges }}
       - name: every program hide uses is there
         run: |
           for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill; do command -v "$c"; done
           command -v proxychains4 || command -v proxychains
-          command -v lyrebird || command -v obfs4proxy
+          if [ "${{ matrix.bridges }}" = obfs4 ]; then command -v lyrebird || command -v obfs4proxy; fi
 
   # A real install on a systemd VM, global mode off (on would cut the runner off from GitHub).
   install:

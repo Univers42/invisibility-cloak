@@ -105,7 +105,7 @@ bridge_conf() {
     while read -r pt; do
         case $pt in
             obfs4 | webtunnel) need="lyrebird (or obfs4proxy)" bin=$(command -v lyrebird || command -v obfs4proxy) ;;
-            snowflake) need=snowflake-client bin=$(command -v snowflake-client) ;;
+            snowflake) need=snowflake-client bin=$(command -v snowflake-client || command -v snowflake-pt-client) ;;
             *) need="a program for '$pt'" bin="" ;;
         esac
         if [[ -z "$bin" ]]; then

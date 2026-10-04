@@ -126,7 +126,7 @@ have() {
 
 # packages [BRIDGES]: what hide needs, plus the program for each bridge transport in use.
 packages() {
-    local c absent=0 t p
+    local c absent=0 t p aur
     local -a bins pkgs ts=()
     for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill; do have "$c" || absent=1; done
     have proxychains4 proxychains || absent=1
@@ -159,8 +159,8 @@ packages() {
     esac
     for t in "${ts[@]}"; do
         case $t in
-            obfs4 | webtunnel) bins=(lyrebird obfs4proxy) pkgs=(lyrebird obfs4proxy obfs4) ;;
-            snowflake) bins=(snowflake-client) pkgs=(snowflake-client snowflake-pt-client snowflake) ;;
+            obfs4 | webtunnel) bins=(lyrebird obfs4proxy) pkgs=(lyrebird obfs4proxy obfs4) aur=lyrebird-proxy ;;
+            snowflake) bins=(snowflake-client snowflake-pt-client) pkgs=(snowflake-client snowflake-pt-client snowflake) aur=snowflake-pt-client ;;
             *) continue ;;
         esac
         have "${bins[@]}" && continue
@@ -171,6 +171,8 @@ packages() {
             have "${bins[@]}" && continue 2
         done
         echo "setup.sh: no package here has ${bins[*]} for $t bridges: install it yourself, or pick other bridges" >&2
+        # Arch ships no bridge program; the AUR does, and AUR helpers don't run as root.
+        if have pacman; then echo "setup.sh: on Arch it's in the AUR: install $aur with your AUR helper, then re-run" >&2; fi
         exit 1
     done
 }
@@ -433,7 +435,8 @@ uninstall_all() {
     systemctl daemon-reload
     rm -f "$SUDOERS"
     for f in "${CHROME_POLICY_DIRS[@]}"; do rm -f "$f/hide-webrtc.json"; done
-    firefox_policy remove
+    # No file, nothing of ours in it (and python3 may be missing after a failed install).
+    if [ -f "$FIREFOX_POLICY" ]; then firefox_policy remove; fi
     for f in /etc/proxychains4.conf /etc/proxychains.conf; do
         if [ -e "$f.hide-bak" ]; then mv "$f.hide-bak" "$f"; fi
     done
