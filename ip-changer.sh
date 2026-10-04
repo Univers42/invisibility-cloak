@@ -6,10 +6,9 @@ YELLOW="\e[33m"
 BLUE="\e[34m"
 MAGENTA="\e[35m"
 CYAN="\e[36m"
-WHITE="\e[37m"
 RESET="\e[0m"
 
-printf "
+printf '%b' "
 ${CYAN}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⣀⣤⡶⠶⠟⠛⠛⠛⠋⠙⠛⠛⠿⢶⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⣴⡾⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⢿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -99,7 +98,7 @@ privoxy "$IPCHANGER/.privoxy/config" > /dev/null 2>&1 &
 while true; do
     echo -e "${YELLOW}Renewing Tor circuit to change IP...${RESET}"
     for ctrl_port in "${CONTROL_PORTS[@]}"; do
-        echo -e "AUTHENTICATE \"\"\r\nSIGNAL NEWNYM\r\nQUIT" | nc 127.0.0.1 $ctrl_port > /dev/null 2>&1
+        echo -e "AUTHENTICATE \"\"\r\nSIGNAL NEWNYM\r\nQUIT" | nc 127.0.0.1 "$ctrl_port" > /dev/null 2>&1
     done
 
     NEW_IP=$(curl --proxy http://127.0.0.1:8118 -s https://api64.ipify.org)
