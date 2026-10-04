@@ -28,6 +28,8 @@ CHROME_POLICY_DIRS=(/etc/opt/chrome/policies/managed /etc/chromium/policies/mana
 # repo file -> installed path
 FILES=(
     "ip-changer-linux.sh /usr/local/lib/ip-changer/ip-changer-linux.sh 755"
+    "bridges/obfs4.txt /usr/local/lib/ip-changer/bridges/obfs4.txt 644"
+    "bridges/snowflake.txt /usr/local/lib/ip-changer/bridges/snowflake.txt 644"
     "bin/hide /usr/local/bin/hide 755"
     "bin/hide-test /usr/local/bin/hide-test 755"
     "bin/global-proxy /usr/local/bin/global-proxy 755"
@@ -215,7 +217,7 @@ install_all() {
     firewall open
 
     say "starting hide.service (kernel rules + jail) and ip-changer.service"
-    if pkill -u "$USER_NAME" -x tor; then
+    if pkill -u "$USER_NAME" -f "/\.tor_multi/tor[0-4]/torrc"; then
         echo "   stopped the Tor that ip-changer ran as $USER_NAME; if it still runs in a terminal, Ctrl+C it."
     fi
     # Global mode can cut this machine off (it did once: DNS). Safety net first, then prove it.
