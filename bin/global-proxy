@@ -12,6 +12,7 @@ SOCKS='socks://127.0.0.1 9050'
 SAVED="${XDG_CONFIG_HOME:-$HOME/.config}/hide/proxy-before"
 KWRITE=$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)
 KREAD=$(command -v kreadconfig6 || command -v kreadconfig5 || true)
+SET="" # the desktop settings this run changed
 
 # Save a setting's value before our first "on"; later "on"s keep the first copy.
 remember() {
@@ -23,6 +24,7 @@ recall() { cat "$SAVED/$1"; }
 kde() {
     { [ -n "$KWRITE" ] && [ -n "$KREAD" ]; } || return 0
     local g=(--file kioslaverc --group 'Proxy Settings') k
+    SET="$SET KDE"
     if [ "$1" = on ]; then
         if [ "$("$KREAD" "${g[@]}" --key socksProxy)" != "$SOCKS" ]; then
             for k in ProxyType socksProxy; do remember "kde.$k" "$("$KREAD" "${g[@]}" --key "$k")"; done
@@ -43,6 +45,7 @@ kde() {
 gnome() {
     gsettings get org.gnome.system.proxy.socks host >/dev/null 2>&1 || return 0
     local p=org.gnome.system.proxy
+    SET="$SET GNOME"
     local ours="'manual' '127.0.0.1' 9050"
     local now
     now="$(gsettings get $p mode) $(gsettings get $p.socks host) $(gsettings get $p.socks port)"
@@ -64,17 +67,18 @@ gnome() {
     fi
 }
 
-# Initialised Firefox profiles (snap and deb). The PAC lives inside the profile
-# because snap confinement blocks Firefox from reading hidden paths in $HOME.
+# Initialised Firefox profiles: classic, XDG (newer Firefox), snap, Flatpak. The PAC lives
+# inside the profile because snap confinement blocks Firefox from reading hidden paths in $HOME.
 firefox_profiles() {
     local p
-    for p in "$HOME"/snap/firefox/common/.mozilla/firefox/*/ "$HOME"/.mozilla/firefox/*/; do
+    for p in "$HOME"/.mozilla/firefox/*/ "${XDG_CONFIG_HOME:-$HOME/.config}"/mozilla/firefox/*/ \
+        "$HOME"/snap/firefox/common/.mozilla/firefox/*/ "$HOME"/.var/app/org.mozilla.firefox/.mozilla/firefox/*/; do
         if [ -f "${p}prefs.js" ]; then printf '%s\n' "${p%/}"; fi
     done
 }
 
-# user.js lines outside (0) or inside (1) our block; other blocks, e.g. born2root's, are outside.
-block_lines() { awk -v b="$BEGIN" -v e="$END" -v want="$2" '$0==b{s=1;next} $0==e{s=0;next} s==want' "$1" 2>/dev/null; }
+# user.js lines outside (0) or inside (1) our block; other tools' blocks are outside.
+block_lines() { [ ! -e "$1" ] || awk -v b="$BEGIN" -v e="$END" -v want="$2" '$0==b{s=1;next} $0==e{s=0;next} s==want' "$1"; }
 
 # Replace our block in user.js with the given lines (none: just drop it). Appended
 # last so it wins over earlier blocks that set the same prefs.
@@ -89,7 +93,7 @@ write_block() {
 pref_line() { grep -E "^user_pref\(\"network\.proxy\.$1\"," | tail -n1; }
 
 # Every site goes to Tor, except those the PAC you used before sent to a proxy on this
-# machine (a local dev site, e.g. born2root's Inception on 127.0.0.1:8118).
+# machine (say, a local dev site behind a proxy on 127.0.0.1:8118).
 write_pac() {
     local p=$1 prev
     prev=$({ block_lines "$p/user.js" 0; cat "$p/global-proxy.before" 2>/dev/null; } | pref_line autoconfig_url | sed -n 's|.*"file://\([^"]*\)".*|\1|p') || true
@@ -152,7 +156,12 @@ on)
     if [ -z "$(ss -ltnH 'sport = :9050')" ]; then
         echo "warning: Tor isn't listening on 9050 — start ip-changer, or nothing will load (fail-closed)." >&2
     fi
-    echo "global proxy ON: desktop apps + Chrome now, Firefox after a restart."
+    if [ -n "$SET" ]; then
+        echo "global proxy ON:${SET} apps + Chrome now, Firefox after a restart."
+    else
+        echo "global proxy ON for Firefox (after a restart). No KDE or GNOME proxy settings here, so Chrome and"
+        echo "other desktop apps aren't covered: use global mode (hide global on) or jail them (hide add)."
+    fi
     ;;
 off)
     kde off
