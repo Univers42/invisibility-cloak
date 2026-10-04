@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# hide — keep apps, or the whole machine, off your real IP via ip-changer's Tor.
+#   hide [status]                what is on, and whether Tor answers
+#   hide global on|off           every app, user and container through Tor (asks for sudo)
+#   hide run <cmd> [args…]       run one command inside the Tor jail
+#   hide add [<app>]             make an app's launcher always start in the jail (no arg: list)
+#   hide remove <app>|--all      undo `hide add`
+#   hide apply|teardown          root, used by hide.service: build / remove the kernel rules
+# How it works and what it can't do: /usr/local/share/doc/hide/HIDE.md
+set -euo pipefail
+
+CONF=/etc/hide/hide.conf
+SELF=/usr/local/bin/hide
+HELPER=/usr/local/libexec/hide-jail
+ENGINE=ipchanger
+NS=hide HOST_IF=hide0 JAIL_IF=hide1 HOST_IP=10.233.233.1 JAIL_IP=10.233.233.2
+TRANS=9040 DNS=9053 RT_TABLE=233
+CONTROL_PORTS="9051, 9061, 9071, 9081, 9091"
+SOCKS_PORTS="9050, 9060, 9070, 9080, 9090"
+STATE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/hide"
+APPDIR="${XDG_DATA_HOME:-${HOME:-}/.local/share}/applications"
+AUTOSTART="${XDG_CONFIG_HOME:-${HOME:-}/.config}/autostart"
+RUN_FILE=""
+
+die() {
+    echo "hide: $*" >&2
+    # Launched from a menu there is no terminal to read the error in.
+    if [ ! -t 2 ]; then notify-send -a hide hide "$*" 2>/dev/null || true; fi
+    exit 1
+}
+
+conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n1 | tr -d '"'; }
+
+# Anything but an explicit "off" means on: a typo must not open the machine up.
+global_mode() { if [ "$(conf_get GLOBAL)" = off ]; then echo off; else echo on; fi; }
+
+# ---- kernel rules (root) ---------------------------------------------------
+
+# One nftables table, replaced atomically. Lines starting with @G only exist in global mode.
+ruleset() {
+    local uid=$1
+    cat <<EOF | if [ "$(global_mode)" = on ]; then sed 's/^@G/  /'; else sed '/^@G/d'; fi
+table inet hide
+delete table inet hide
+table inet hide {
+    set local4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } }
+    set local6 { type ipv6_addr; flags interval; elements = { ::1, fc00::/7, fe80::/10, ff00::/8 } }
+
+    # The jail (always) and containers/VMs (global): TCP -> Tor TransPort, DNS -> Tor DNSPort.
+    chain nat_pre {
+        type nat hook prerouting priority dstnat - 1; policy accept;
+        iifname "$HOST_IF" udp dport 53 redirect to :$DNS
+        # Jailed apps' proxy settings (127.0.0.1:9050…, from global-proxy) reach Tor's SOCKS ports.
+        iifname "$HOST_IF" ip daddr $HOST_IP tcp dport { $SOCKS_PORTS } dnat ip to 127.0.0.1
+        iifname "$HOST_IF" meta l4proto tcp redirect to :$TRANS
+@G      meta iifkind { "bridge", "veth", "vxlan" } udp dport 53 redirect to :$DNS
+@G      meta iifkind { "bridge", "veth", "vxlan" } ip daddr != @local4 meta l4proto tcp redirect to :$TRANS
+    }
+
+    # Global: this machine's own traffic, every user except the Tor engine itself. Sent to
+    # this machine's own address on the outgoing card, not 127.0.0.1 ("redirect"): sockets
+    # pinned to a card (systemd-resolved does it) can't reach 127.0.0.1, and all DNS died.
+    chain nat_out {
+        type nat hook output priority dstnat - 1; policy accept;
+@G      meta skuid $uid return
+@G      ip daddr != 127.0.0.0/8 udp dport 53 dnat ip to ip saddr : $DNS
+@G      ip daddr != @local4 meta l4proto tcp dnat ip to ip saddr : $TRANS
+    }
+
+    chain filter_out {
+        type filter hook output priority filter; policy accept;
+        # Tor's control ports have no password: only the engine may use them, or any app
+        # could tell Tor to connect straight to a server of its choice (= your real IP).
+        ip daddr 127.0.0.0/8 tcp dport { $CONTROL_PORTS } meta skuid != $uid drop
+@G      meta skuid $uid accept
+@G      # This machine's own addresses: loopback, and where nat_out sends traffic to Tor.
+@G      fib daddr type local accept
+@G      # UPnP / NAT-PMP would let any app ask the router for your public IP.
+@G      udp dport { 1900, 5351 } drop
+@G      meta l4proto { tcp, udp } th dport 53 drop
+@G      # Whatever Tor can't carry (UDP, ICMP, IPv6) never leaves: apps get EPERM.
+@G      ip daddr != @local4 drop
+@G      ip6 daddr != @local6 drop
+    }
+
+    chain filter_in {
+        type filter hook input priority filter; policy accept;
+        iifname "$HOST_IF" tcp dport $TRANS accept
+        iifname "$HOST_IF" udp dport $DNS accept
+        iifname "$HOST_IF" ip daddr 127.0.0.1 tcp dport { $SOCKS_PORTS } accept
+        iifname "$HOST_IF" drop
+        # TransPort/DNSPort listen on 0.0.0.0 for containers: never serve the LAN.
+        meta l4proto { tcp, udp } th dport { $TRANS, $DNS } iifname != "lo" meta iifkind != { "bridge", "veth", "vxlan" } drop
+    }
+
+    chain filter_fwd {
+        type filter hook forward priority filter; policy accept;
+        iifname "$HOST_IF" drop
+        oifname "$HOST_IF" drop
+@G      udp dport { 1900, 5351 } drop
+@G      meta l4proto { tcp, udp } th dport 53 drop
+@G      ip daddr != @local4 drop
+@G      ip6 daddr != @local6 drop
+    }
+}
+EOF
+}
+
+# The jail: network namespace "hide", linked to the host by a veth pair. Idempotent.
+jail_up() {
+    [ -e "/run/netns/$NS" ] || ip netns add "$NS"
+    ip link show "$HOST_IF" >/dev/null 2>&1 || ip link add "$HOST_IF" type veth peer name "$JAIL_IF" netns "$NS"
+    ip addr replace "$HOST_IP/30" dev "$HOST_IF"
+    ip link set "$HOST_IF" up
+    # Lets the SOCKS rule in nat_pre deliver jail packets to Tor on 127.0.0.1.
+    sysctl -qw "net.ipv4.conf.$HOST_IF.route_localnet=1"
+    ip -n "$NS" addr replace "$JAIL_IP/30" dev "$JAIL_IF"
+    ip -n "$NS" link set lo up
+    ip -n "$NS" link set "$JAIL_IF" up
+    ip -n "$NS" route replace default via "$HOST_IP"
+    # No IPv6 in the jail. route_localnet lets the rules below send 127.x packets out.
+    ip netns exec "$NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 "net.ipv4.conf.$JAIL_IF.route_localnet=1"
+    # Apps resolve through /etc/resolv.conf = 127.0.0.53 and proxy to 127.0.0.1:9050…, which
+    # inside the jail is the jail's own loopback: hand both to Tor on the host side.
+    ip netns exec "$NS" nft -f - <<EOF
+table ip hidejail
+delete table ip hidejail
+table ip hidejail {
+    chain out {
+        type nat hook output priority dstnat; policy accept;
+        ip daddr 127.0.0.0/8 udp dport 53 dnat to $HOST_IP:$DNS
+        ip daddr 127.0.0.0/8 tcp dport { $SOCKS_PORTS } dnat to $HOST_IP
+    }
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "$JAIL_IF" ip saddr 127.0.0.0/8 snat to $JAIL_IP
+    }
+}
+EOF
+    # Fail-closed even if nftables gets flushed: jail packets are never routed onward.
+    ip route replace unreachable default table "$RT_TABLE"
+    ip rule show | grep -q "iif $HOST_IF lookup $RT_TABLE" || ip rule add iif "$HOST_IF" priority 100 lookup "$RT_TABLE"
+}
+
+apply() {
+    [ "$(id -u)" -eq 0 ] || die "apply needs root (hide.service runs it)"
+    local uid
+    uid=$(id -u "$ENGINE") || die "no '$ENGINE' user: run setup.sh install"
+    ruleset "$uid" | nft -f -
+    jail_up
+}
+
+teardown() {
+    [ "$(id -u)" -eq 0 ] || die "teardown needs root (hide.service runs it)"
+    nft delete table inet hide 2>/dev/null || true
+    ip netns del "$NS" 2>/dev/null || true # takes the veth pair and the jail's table with it
+    ip link del "$HOST_IF" 2>/dev/null || true
+    while ip rule del iif "$HOST_IF" lookup "$RT_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$RT_TABLE" 2>/dev/null || true
+}
+
+global() {
+    case "${1:-}" in on | off) ;; *) die "usage: hide global on|off" ;; esac
+    [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" global "$1"
+    if grep -q '^GLOBAL=' "$CONF"; then sed -i "s/^GLOBAL=.*/GLOBAL=$1/" "$CONF"; else echo "GLOBAL=$1" >>"$CONF"; fi
+    systemctl reload-or-restart hide.service
+    echo "global mode $1."
+}
+
+# ---- the jail, for one command (as you) ------------------------------------
+
+# A single-instance app (browser, Electron) already running outside the jail would
+# just open a window in that instance and keep your real IP. Launchers refuse; a
+# terminal `hide run` only warns, since `hide run python3 …` is fine next to other pythons.
+check_outside() {
+    local strict=$1 a name="" n pid jail
+    shift
+    for a in "$@"; do
+        case "$a" in env | /usr/bin/env | [A-Za-z_]*=*) continue ;; esac
+        name=$(basename "$a")
+        break
+    done
+    [ -n "$name" ] || return 0
+    jail=$(stat -L -c %i "/run/netns/$NS" 2>/dev/null) || return 0 # jail down: hide-jail refuses anyway
+    # ponytail: name match (comm is 15 chars), plus google-chrome-stable -> chrome and the like.
+    for n in "$name" "$(sed -E 's/^google-//; s/-(stable|beta|browser|bin)$//' <<<"$name")"; do
+        for pid in $(pgrep -u "$(id -u)" -i -x -- "${n:0:15}" || true); do
+            [ "$(stat -L -c %i "/proc/$pid/ns/net" 2>/dev/null)" != "$jail" ] || continue
+            if [ "$strict" = 1 ]; then
+                die "$n is already running outside the Tor jail (pid $pid): quit it completely, then start it again."
+            fi
+            echo "hide: warning: $n also runs outside the jail (pid $pid); a single-instance app would hand this launch to it." >&2
+            return 0
+        done
+    done
+}
+
+run() {
+    local strict=0
+    if [ "${1:-}" = --app ]; then strict=1 && shift; fi
+    [ $# -gt 0 ] || die "usage: hide run <command> [args…]"
+    check_outside "$strict" "$@"
+    local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hide"
+    mkdir -p "$dir" && chmod 700 "$dir"
+    RUN_FILE=$(mktemp "$dir/run.XXXXXX")
+    trap 'rm -f "$RUN_FILE"' EXIT
+    # Your environment travels in a private file, not on sudo's command line (which is logged).
+    { env -0; printf '\0'; printf '%s\0' "$@"; } >"$RUN_FILE"
+    sudo -n "$HELPER" "$RUN_FILE"
+}
+
+# Runs as you, already inside the jail (hide-jail put it there): rebuild env + argv, exec.
+enter() {
+    local rec i
+    mapfile -d '' rec <"$1"
+    rm -f "$1"
+    for i in "${!rec[@]}"; do [ -n "${rec[i]}" ] || break; done
+    { [ "${#rec[@]}" -gt 0 ] && [ -z "${rec[i]}" ]; } || die "malformed run file"
+    exec /usr/bin/env -i "${rec[@]:0:i}" "${rec[@]:i+1}"
+}
+
+# ---- launchers --------------------------------------------------------------
+
+app_dirs() {
+    local dirs d
+    IFS=: read -ra dirs <<<"${XDG_DATA_HOME:-$HOME/.local/share}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:/var/lib/snapd/desktop:/var/lib/flatpak/exports/share:$HOME/.local/share/flatpak/exports/share"
+    for d in "${dirs[@]}"; do
+        if [ -d "$d/applications" ]; then printf '%s\n' "$d/applications"; fi
+    done
+}
+
+# "<id>\t<file>" per launcher; the first one per id wins (XDG precedence); ours are skipped.
+launchers() {
+    local d f id
+    declare -A seen=()
+    while read -r d; do
+        for f in "$d"/*.desktop; do
+            [ -f "$f" ] || continue
+            if grep -q '^X-Hide=true' "$f"; then continue; fi
+            id=$(basename "$f" .desktop)
+            [ -z "${seen[$id]:-}" ] || continue
+            seen[$id]=1
+            printf '%s\t%s\n' "$id" "$f"
+        done
+    done < <(app_dirs)
+}
+
+desktop_name() { sed -n '/^Name=/{s///p;q}' "$1"; }
+
+# Does launcher <id>/<name> answer to what the user typed? id, snap id (x_x), the last
+# part of a flatpak id (com.discordapp.Discord), or the visible name; any case.
+matches() {
+    local id=${1,,} name=${2,,} want=${3,,}
+    name=${name% (tor)}
+    [ "$id" = "$want" ] || [ "$id" = "${want}_$want" ] || [ "${id##*.}" = "$want" ] || [ "$name" = "$want" ]
+}
+
+list_apps() {
+    local id f
+    while IFS=$'\t' read -r id f; do
+        if grep -qi '^NoDisplay=true' "$f"; then continue; fi
+        printf '%-45s %s\n' "$id" "$(desktop_name "$f")"
+    done < <(launchers) | sort
+}
+
+# A copy of a launcher whose every Exec= starts inside the Tor jail.
+jailed() {
+    awk -v run="$SELF run --app " '
+        /^\[/ { sec = $0; print; if (sec == "[Desktop Entry]") print "X-Hide=true"; next }
+        sec == "[Desktop Entry]" && /^(DBusActivatable|TryExec)=/ { next }
+        /^Exec=/ { sub(/^Exec=/, "Exec=" run) }
+        sec == "[Desktop Entry]" && /^Name(\[[^]]*\])?=/ { $0 = $0 " (Tor)" }
+        { print }' "$1"
+}
+
+# Keep the user's own file (never one we wrote) so `remove` can put it back.
+backup() { # <file> <applications|autostart>
+    [ -f "$1" ] || return 0
+    if grep -q '^X-Hide=true' "$1"; then return 0; fi
+    mkdir -p "$STATE/backup/$2"
+    cp -p "$1" "$STATE/backup/$2/"
+}
+
+restore() { # <id> <applications|autostart>
+    local b="$STATE/backup/$2/$1.desktop" dst=$APPDIR
+    [ "$2" = applications ] || dst=$AUTOSTART
+    if [ -f "$b" ]; then mv "$b" "$dst/"; fi
+}
+
+add() {
+    [ $# -gt 0 ] || {
+        list_apps
+        return
+    }
+    local id="" f name src
+    while IFS=$'\t' read -r id f; do
+        if matches "$id" "$(desktop_name "$f")" "$1"; then src=$f && break; fi
+        id=""
+    done < <(launchers)
+    [ -n "$id" ] || die "no launcher matches '$1' — 'hide add' lists them"
+    mkdir -p "$APPDIR"
+    backup "$APPDIR/$id.desktop" applications
+    jailed "$src" >"$APPDIR/$id.desktop.tmp"
+    mv "$APPDIR/$id.desktop.tmp" "$APPDIR/$id.desktop"
+    if [ -f "$AUTOSTART/$id.desktop" ] && ! grep -q '^X-Hide=true' "$AUTOSTART/$id.desktop"; then
+        backup "$AUTOSTART/$id.desktop" autostart
+        jailed "$STATE/backup/autostart/$id.desktop" >"$AUTOSTART/$id.desktop"
+    fi
+    for f in "$AUTOSTART"/*.desktop; do
+        [ "$f" != "$AUTOSTART/$id.desktop" ] || continue
+        if grep -qsi -- "$1" "$f"; then echo "hide: warning: $f may also start $1 outside the jail at login." >&2; fi
+    done
+    name=$(desktop_name "$src")
+    echo "$name ($id) now starts in the Tor jail. If it is open, quit it fully first. Undo: hide remove $1"
+}
+
+remove() {
+    [ $# -gt 0 ] || die "usage: hide remove <app>|--all"
+    local f id found=0
+    for f in "$APPDIR"/*.desktop; do
+        grep -qs '^X-Hide=true' "$f" || continue
+        id=$(basename "$f" .desktop)
+        [ "$1" = --all ] || matches "$id" "$(desktop_name "$f")" "$1" || continue
+        rm -f "$f"
+        restore "$id" applications
+        if grep -qs '^X-Hide=true' "$AUTOSTART/$id.desktop"; then rm -f "$AUTOSTART/$id.desktop"; fi
+        restore "$id" autostart
+        echo "$id: starts normally again."
+        found=1
+    done
+    [ "$found" = 1 ] || [ "$1" = --all ] || die "no jailed launcher matches '$1'"
+}
+
+status() {
+    local ip f
+    echo "engine : ip-changer.service $(systemctl is-active ip-changer 2>/dev/null)"
+    echo "rules  : hide.service $(systemctl is-active hide 2>/dev/null), global mode $(global_mode), jail $([ -e "/run/netns/$NS" ] && echo up || echo down)"
+    ip=$(curl -s --max-time 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null |
+        sed -n 's/.*"IsTor":true,"IP":"\([^"]*\)".*/\1/p') || true
+    if [ -n "$ip" ]; then echo "tor    : Tor exit $ip"; else echo "tor    : not answering on 127.0.0.1:9050"; fi
+    for f in "$APPDIR"/*.desktop; do
+        if grep -qs '^X-Hide=true' "$f"; then echo "jailed : $(basename "$f" .desktop)"; fi
+    done
+}
+
+case "${1:-status}" in
+status) status ;;
+global) global "${2:-}" ;;
+run) shift && run "$@" ;;
+add) shift && add "$@" ;;
+remove) shift && remove "$@" ;;
+apply) apply ;;
+teardown) teardown ;;
+__enter) enter "$2" ;;
+*)
+    sed -n '2,9s/^# \{0,1\}//p' "$0" >&2
+    exit 2
+    ;;
+esac

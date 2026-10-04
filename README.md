@@ -19,6 +19,22 @@ A powerful and easy-to-use tool to change your IP address automatically using **
 
 ---
 
+## 🛡 Linux: hide every app's IP (`hide`)
+
+On a systemd Linux desktop, `setup.sh` turns ip-changer into a boot service. Kernel rules then force every app (global mode) or only the apps you pick (a network-namespace jail) through Tor. If Tor is down, traffic stops; it never falls back to your real IP. Setup also installs WebRTC-safe browser policies.
+
+```bash
+sudo ./setup.sh install      # apt, dnf or pacman; settings in hide.conf
+hide-test                    # self-test: every check must PASS
+hide add discord             # this app always starts inside the Tor jail
+hide-rescue                  # offline after a change? internet back now (no network needed)
+sudo ./setup.sh uninstall    # remove it all, restore the previous config
+```
+
+How it works, what it breaks and its limits: [docs/HIDE.md](docs/HIDE.md).
+
+---
+
 ## 🛠 Installation
 
 ### Method 1: Using `curl` (Manual Installation)

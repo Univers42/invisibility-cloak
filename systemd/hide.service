@@ -1,0 +1,18 @@
+[Unit]
+Description=hide: Tor jail + nftables (global mode per /etc/hide/hide.conf)
+Documentation=file:///usr/local/share/doc/hide/HIDE.md
+# Before any network is up, so global mode never has a direct-traffic window.
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/hide apply
+ExecReload=/usr/local/bin/hide apply
+ExecStop=/usr/local/bin/hide teardown
+
+[Install]
+WantedBy=multi-user.target

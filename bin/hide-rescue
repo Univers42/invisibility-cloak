@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# hide-rescue — get the internet back now, whatever state hide is in. Needs no network.
+#   hide-rescue             global mode off + its kernel rules removed + DNS reset; restarts
+#                           NetworkManager if still offline. Jailed apps stay offline (by design).
+#   hide-rescue --direct    also turn the desktop/Firefox proxy off: browsers go DIRECT, not via Tor
+#   hide-rescue --in 5m     safety net before a risky change: runs by itself in 5 min
+#   hide-rescue --cancel    disarm that timer once the change works
+# Every step runs even if an earlier one fails (no set -e on purpose).
+set -uo pipefail
+
+CONF=/etc/hide/hide.conf
+UNIT=hide-rescue
+[ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" "$@"
+
+online() { [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 https://www.wikipedia.org/ 2>/dev/null)" = 200 ]; }
+
+case "${1:-}" in
+--in)
+    systemctl stop "$UNIT.timer" 2>/dev/null
+    systemd-run --quiet --collect --unit="$UNIT" --on-active="${2:?usage: hide-rescue --in 5m}" "$(readlink -f "$0")" &&
+        echo "armed: hide-rescue runs in $2 unless you run: hide-rescue --cancel"
+    exit
+    ;;
+--cancel)
+    if systemctl stop "$UNIT.timer" 2>/dev/null; then echo "disarmed."; else echo "nothing armed."; fi
+    exit 0
+    ;;
+"" | --direct) ;;
+*)
+    sed -n '2,7s/^# \{0,1\}//p' "$0" >&2
+    exit 2
+    ;;
+esac
+
+echo "1. global mode off (kept off after reboot)"
+if [ -f "$CONF" ]; then sed -i 's/^GLOBAL=.*/GLOBAL=off/' "$CONF"; fi
+nft delete table inet hide 2>/dev/null # the global rules, gone at once, even if hide itself is broken
+# Rebuild the jail's rules in off mode; if this fails the table just stays deleted (= direct).
+systemctl restart hide.service 2>/dev/null || echo "   (hide.service didn't restart: jailed apps stay offline, the rest is direct)"
+
+echo "2. DNS caches and server state reset"
+resolvectl flush-caches 2>/dev/null
+resolvectl reset-server-features 2>/dev/null
+
+if [ "${1:-}" = --direct ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    echo "3. desktop + Firefox proxy off: browsers now go DIRECT (restart Firefox). Undo: global-proxy on"
+    uid=$(id -u "$SUDO_USER")
+    sudo -u "$SUDO_USER" -H env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        /usr/local/bin/global-proxy off >/dev/null 2>&1 || echo "   global-proxy off failed: set the proxy to 'none' in System Settings"
+fi
+
+if online; then
+    echo "internet: OK"
+    exit 0
+fi
+echo "still offline: restarting NetworkManager"
+systemctl restart NetworkManager 2>/dev/null
+for _ in 1 2 3 4 5 6; do
+    sleep 5
+    if online; then
+        echo "internet: OK"
+        exit 0
+    fi
+done
+echo "internet: still DOWN. It isn't hide's rules any more (they're gone): check the cable/Wi-Fi, or reboot." >&2
+exit 1

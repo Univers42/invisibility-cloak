@@ -1,0 +1,24 @@
+[Unit]
+Description=ip-changer: 5 rotating Tor instances (SOCKS 9050-9090, TransPort 9040, DNSPort 9053)
+Documentation=file:///usr/local/share/doc/hide/HIDE.md
+Wants=network-online.target
+After=network-online.target hide.service
+
+[Service]
+# Its own user: global mode lets only this uid reach the internet directly.
+User=ipchanger
+Group=ipchanger
+EnvironmentFile=/etc/hide/hide.conf
+Environment=IPCHANGER_DIR=/var/lib/ip-changer IPCHANGER_TRANS_PORT=0.0.0.0:9040 IPCHANGER_DNS_PORT=0.0.0.0:9053
+StateDirectory=ip-changer
+StateDirectoryMode=0700
+ExecStart=/usr/local/lib/ip-changer/ip-changer-linux.sh -r ${ROTATE}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

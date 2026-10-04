@@ -1,0 +1,18 @@
+#!/bin/bash
+# hide-jail — the only root step of `hide run` (sudoers: NOPASSWD for this file only).
+# Moves the caller into the Tor jail's network namespace, drops straight back to the
+# caller's own uid/gids, then lets `hide __enter` (as the caller) start the command.
+# Root never reads the caller's arguments or environment.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ ${SUDO_UID:-} =~ ^[1-9][0-9]*$ && ${SUDO_GID:-} =~ ^[0-9]+$ ]] || {
+    echo "hide-jail: use 'hide run <command>'" >&2
+    exit 1
+}
+[ $# -eq 1 ] || exit 2
+# Refuse unless the fail-closed pieces are all in place (route guard, nft table, netns).
+if ! { [ -e /run/netns/hide ] && ip rule show | grep -q 'iif hide0 lookup 233' && nft list table inet hide >/dev/null 2>&1; }; then
+    echo "hide-jail: the Tor jail is down — sudo systemctl restart hide" >&2
+    exit 1
+fi
+exec nsenter --net=/run/netns/hide -- setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- /usr/local/bin/hide __enter "$1"

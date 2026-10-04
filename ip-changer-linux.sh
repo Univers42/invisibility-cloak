@@ -1,5 +1,5 @@
 #!/bin/bash
-IPCHANGER="/usr/share/ip-changer"
+IPCHANGER="${IPCHANGER_DIR:-/usr/share/ip-changer}"
 RED="\e[31m"
 GREEN="\e[32m"
 YELLOW="\e[33m"
@@ -72,6 +72,12 @@ while getopts ":r:h" opt; do
     esac
 done
 
+# setup.sh runs ip-changer as a boot service; a second copy would only fight it for the ports.
+if [[ -z "${INVOCATION_ID:-}" ]] && systemctl is-active --quiet ip-changer 2>/dev/null; then
+    echo -e "${YELLOW}ip-changer already runs as a service. Live log: journalctl -fu ip-changer${RESET}"
+    exit 0
+fi
+
 # Check if Tor is installed
 if ! command -v tor &> /dev/null; then
     echo -e "${RED}Tor is not installed. Please install it first:${RESET}"
@@ -80,7 +86,7 @@ if ! command -v tor &> /dev/null; then
 fi
 
 printf "Starting multitor service...\n"
-pkill tor
+pkill -x tor
 mkdir -p "$IPCHANGER/.tor_multi"
 
 PORTS=(9050 9060 9070 9080 9090)
@@ -95,6 +101,10 @@ ControlPort ${CONTROL_PORTS[$i]}
 DataDirectory $TOR_DIR
 CookieAuthentication 0
 EOF
+    # The service also makes instance 0 the transparent proxy used by `hide` (global mode + app jail).
+    if [[ $i -eq 0 && -n "${IPCHANGER_TRANS_PORT:-}" ]]; then
+        printf 'TransPort %s IsolateDestAddr\nDNSPort %s\n' "$IPCHANGER_TRANS_PORT" "$IPCHANGER_DNS_PORT" >> "$TOR_DIR/torrc"
+    fi
     tor -f "$TOR_DIR/torrc" > /dev/null 2>&1 &
     sleep 2
 done
@@ -106,7 +116,7 @@ while true; do
     done
 
     # Check IP through first Tor instance
-    NEW_IP=$(curl --socks5 127.0.0.1:9050 -s https://api64.ipify.org)
+    NEW_IP=$(curl --socks5-hostname 127.0.0.1:9050 -s https://api64.ipify.org)
     if [[ -z "$NEW_IP" ]]; then
         echo -e "${RED}[!] Failed to get new IP. Retrying...${RESET}"
         sleep 5

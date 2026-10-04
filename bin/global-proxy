@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# global-proxy on|off — point the desktop proxy settings (KDE, GNOME) and Firefox at
+# ip-changer's Tor SOCKS ports (127.0.0.1:9050-9090). This covers proxy-aware apps
+# when hide's GLOBAL=off; with GLOBAL=on the kernel already forces everything into Tor.
+# Fail-closed: while on, nothing falls back to your real IP. "off" restores what was
+# set before the first "on". Firefox only reads proxy settings at startup: restart it.
+set -euo pipefail
+
+BEGIN='// >>> global-proxy: Tor >>>'
+END='// <<< global-proxy: Tor <<<'
+SOCKS='socks://127.0.0.1 9050'
+SAVED="${XDG_CONFIG_HOME:-$HOME/.config}/hide/proxy-before"
+KWRITE=$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)
+KREAD=$(command -v kreadconfig6 || command -v kreadconfig5 || true)
+
+# Save a setting's value before our first "on"; later "on"s keep the first copy.
+remember() {
+    mkdir -p "$SAVED"
+    [ -e "$SAVED/$1" ] || printf '%s\n' "$2" >"$SAVED/$1"
+}
+recall() { cat "$SAVED/$1"; }
+
+kde() {
+    { [ -n "$KWRITE" ] && [ -n "$KREAD" ]; } || return 0
+    local g=(--file kioslaverc --group 'Proxy Settings') k
+    if [ "$1" = on ]; then
+        if [ "$("$KREAD" "${g[@]}" --key socksProxy)" != "$SOCKS" ]; then
+            for k in ProxyType socksProxy; do remember "kde.$k" "$("$KREAD" "${g[@]}" --key "$k")"; done
+        fi
+        "$KWRITE" "${g[@]}" --key ProxyType 1
+        "$KWRITE" "${g[@]}" --key socksProxy "$SOCKS"
+    elif [ -e "$SAVED/kde.ProxyType" ]; then
+        for k in ProxyType socksProxy; do
+            if [ -n "$(recall "kde.$k")" ]; then "$KWRITE" "${g[@]}" --key "$k" "$(recall "kde.$k")"; else "$KWRITE" "${g[@]}" --key "$k" --delete; fi
+        done
+    elif [ "$("$KREAD" "${g[@]}" --key socksProxy)" = "$SOCKS" ]; then
+        "$KWRITE" "${g[@]}" --key ProxyType 0 # set by an older global-proxy that saved nothing
+    fi
+    # Running KDE apps re-read it on this signal; Chrome watches the file itself.
+    dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:'' 2>/dev/null || true
+}
+
+gnome() {
+    gsettings get org.gnome.system.proxy.socks host >/dev/null 2>&1 || return 0
+    local p=org.gnome.system.proxy
+    local ours="'manual' '127.0.0.1' 9050"
+    local now
+    now="$(gsettings get $p mode) $(gsettings get $p.socks host) $(gsettings get $p.socks port)"
+    if [ "$1" = on ]; then
+        if [ "$now" != "$ours" ]; then
+            remember gnome.mode "$(gsettings get $p mode)"
+            remember gnome.host "$(gsettings get $p.socks host)"
+            remember gnome.port "$(gsettings get $p.socks port)"
+        fi
+        gsettings set $p.socks host 127.0.0.1
+        gsettings set $p.socks port 9050
+        gsettings set $p mode manual
+    elif [ -e "$SAVED/gnome.mode" ]; then
+        gsettings set $p.socks host "$(recall gnome.host)"
+        gsettings set $p.socks port "$(recall gnome.port)"
+        gsettings set $p mode "$(recall gnome.mode)"
+    elif [ "$now" = "$ours" ]; then
+        gsettings set $p mode none
+    fi
+}
+
+# Initialised Firefox profiles (snap and deb). The PAC lives inside the profile
+# because snap confinement blocks Firefox from reading hidden paths in $HOME.
+firefox_profiles() {
+    local p
+    for p in "$HOME"/snap/firefox/common/.mozilla/firefox/*/ "$HOME"/.mozilla/firefox/*/; do
+        if [ -f "${p}prefs.js" ]; then printf '%s\n' "${p%/}"; fi
+    done
+}
+
+# user.js lines outside (0) or inside (1) our block; other blocks, e.g. born2root's, are outside.
+block_lines() { awk -v b="$BEGIN" -v e="$END" -v want="$2" '$0==b{s=1;next} $0==e{s=0;next} s==want' "$1" 2>/dev/null; }
+
+# Replace our block in user.js with the given lines (none: just drop it). Appended
+# last so it wins over earlier blocks that set the same prefs.
+write_block() {
+    local userjs=$1
+    shift
+    block_lines "$userjs" 0 >"$userjs.gp-tmp" || true
+    if [ $# -gt 0 ]; then printf '%s\n' "$BEGIN" "$@" "$END" >>"$userjs.gp-tmp"; fi
+    mv "$userjs.gp-tmp" "$userjs"
+}
+
+pref_line() { grep -E "^user_pref\(\"network\.proxy\.$1\"," | tail -n1; }
+
+# Every site goes to Tor, except those the PAC you used before sent to a proxy on this
+# machine (a local dev site, e.g. born2root's Inception on 127.0.0.1:8118).
+write_pac() {
+    local p=$1 prev
+    prev=$({ block_lines "$p/user.js" 0; cat "$p/global-proxy.before" 2>/dev/null; } | pref_line autoconfig_url | sed -n 's|.*"file://\([^"]*\)".*|\1|p') || true
+    {
+        cat <<'EOF'
+function FindProxyForURL(url, host) {
+    var before = String(previousFindProxyForURL(url, host)).split(";")[0].trim();
+    if (/^PROXY (127\.|localhost:|\[::1\]:)/.test(before))
+        return before;
+    return "SOCKS5 127.0.0.1:9050; SOCKS5 127.0.0.1:9060; SOCKS5 127.0.0.1:9070; SOCKS5 127.0.0.1:9080; SOCKS5 127.0.0.1:9090";
+}
+EOF
+        if [ -n "$prev" ] && [ "$prev" != "$p/tor.pac" ] && [ -f "$prev" ]; then
+            sed 's/\bFindProxyForURL\b/previousFindProxyForURL/g' "$prev"
+        else
+            echo 'function previousFindProxyForURL(url, host) { return "DIRECT"; }'
+        fi
+    } >"$p/tor.pac.tmp"
+    mv "$p/tor.pac.tmp" "$p/tor.pac"
+}
+
+firefox() {
+    local p type url
+    while read -r p; do
+        [ -n "$p" ] || continue
+        if [ "$1" = on ]; then
+            # Not on yet: keep the profile's proxy prefs for "off" (values our last "off"
+            # pinned in user.js come last, so they win over a stale prefs.js).
+            if ! grep -qF '/tor.pac"' "$p/user.js" 2>/dev/null && [ ! -e "$p/global-proxy.before" ]; then
+                { grep -E '^user_pref\("network\.proxy\.(type|autoconfig_url)",' "$p/prefs.js" || true; block_lines "$p/user.js" 1; } >"$p/global-proxy.before"
+            fi
+            write_pac "$p"
+            # The WebRTC and no-bypass prefs are locked for every profile by setup.sh's
+            # /etc/firefox/policies/policies.json; this block only selects the PAC.
+            write_block "$p/user.js" \
+                'user_pref("network.proxy.type", 2);' \
+                "user_pref(\"network.proxy.autoconfig_url\", \"file://$p/tor.pac\");"
+        elif grep -qxF "$BEGIN" "$p/user.js" 2>/dev/null; then
+            if [ -n "$(block_lines "$p/user.js" 0 | pref_line type)" ]; then
+                write_block "$p/user.js" # another block sets the proxy: it applies again
+            else
+                # prefs.js keeps our values until Firefox next starts, so pin the old ones
+                # (Firefox's defaults when it had none: 5 = use system settings).
+                type=$(pref_line type 2>/dev/null <"$p/global-proxy.before") || true
+                url=$(pref_line autoconfig_url 2>/dev/null <"$p/global-proxy.before") || true
+                write_block "$p/user.js" \
+                    "${type:-user_pref(\"network.proxy.type\", 5);}" \
+                    "${url:-user_pref(\"network.proxy.autoconfig_url\", \"\");}"
+            fi
+            rm -f "$p/tor.pac" "$p/global-proxy.before"
+        fi
+    done < <(firefox_profiles)
+}
+
+case "${1:-}" in
+on)
+    kde on
+    gnome on
+    firefox on
+    if [ -z "$(ss -ltnH 'sport = :9050')" ]; then
+        echo "warning: Tor isn't listening on 9050 — start ip-changer, or nothing will load (fail-closed)." >&2
+    fi
+    echo "global proxy ON: desktop apps + Chrome now, Firefox after a restart."
+    ;;
+off)
+    kde off
+    gnome off
+    firefox off
+    rm -rf "$SAVED" # restored: the next "on" saves whatever is set then
+    echo "global proxy OFF: desktop apps + Chrome now, Firefox after a restart."
+    ;;
+*)
+    echo "usage: global-proxy on|off" >&2
+    exit 2
+    ;;
+esac

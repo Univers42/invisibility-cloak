@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# hide-test — prove that hide works on this machine; exits non-zero on any FAIL.
+# It never shows your real IP: a pass is check.torproject.org answering "IsTor":true
+# (an address your own connection can't have); on a failure only the verdict is shown.
+#   hide-test [--rotation] [--full] [--docker]
+#     --rotation  wait one ROTATE period and check that the Tor exit changed
+#     --full      stop the Tor engine, check traffic then FAILS instead of going direct,
+#                 restart it (needs sudo)
+#     --docker    check a container on a bridge network goes through Tor (global mode)
+set -uo pipefail
+
+CHECK=https://check.torproject.org/api/ip
+CONF=/etc/hide/hide.conf
+ENGINE=ipchanger
+rotation=0 full=0 docker=0
+for a in "$@"; do
+    case "$a" in
+    --rotation) rotation=1 ;;
+    --full) full=1 ;;
+    --docker) docker=1 ;;
+    *)
+        sed -n '2,9s/^# \{0,1\}//p' "$0" >&2
+        exit 2
+        ;;
+    esac
+done
+
+pass=0 fail=0 warn=0 skip=0
+ok() { pass=$((pass + 1)) && printf '  \e[32mPASS\e[0m %s\n' "$*"; }
+bad() { fail=$((fail + 1)) && printf '  \e[31mFAIL\e[0m %s\n' "$*"; }
+meh() { warn=$((warn + 1)) && printf '  \e[33mWARN\e[0m %s\n' "$*"; }
+skp() { skip=$((skip + 1)) && printf '  SKIP %s\n' "$*"; }
+section() { printf '\n\e[1m%s\e[0m\n' "$*"; }
+conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n1 | tr -d '"'; }
+
+# Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true.
+tor_ip() {
+    local r
+    r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || return 1
+    [[ $r == *'"IsTor":true'* ]] || return 1
+    r=${r#*\"IP\":\"}
+    printf '%s\n' "${r%%\"*}"
+}
+
+# "<label> <cmd…>": the command must NOT reach the internet. Seeing IsTor:false would mean
+# it went out directly — a leak (the address in that answer is never printed).
+closed() {
+    local label=$1 r
+    shift
+    r=$("$@" -s --max-time 20 "$CHECK" 2>/dev/null) || true
+    case "$r" in
+    *'"IsTor":false'*) bad "$label: LEAK — reached the internet directly" ;;
+    *'"IsTor":true'*) bad "$label: still reached Tor (engine not actually down?)" ;;
+    *) ok "$label: fails closed (no connection at all)" ;;
+    esac
+}
+
+# Network probes, python3 stdlib only. Each prints short verdict words, never an address.
+PROBE='
+import os, socket, sys, threading
+
+def udp(host, port, payload, timeout=4, want=None, dev=None):
+    try:
+        addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+    except OSError:
+        return "nodns"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        if dev:  # pinned to one network card, as systemd-resolved does
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+        s.sendto(payload, addr)
+        if want is None:
+            return "sent"
+        return want(payload, s.recv(4096))
+    except PermissionError:
+        return "eperm"
+    except OSError:
+        return "blocked"
+
+STUN = b"\x00\x01\x00\x00\x21\x12\xa4\x42"
+def stun_ok(q, r):
+    return "reply" if r[:2] == b"\x01\x01" else "other"
+
+def dns_query(name):
+    labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
+    return os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + b"\x00\x00\x01\x00\x01"
+def dns_ok(q, r):
+    return "answer" if r[:2] == q[:2] and int.from_bytes(r[6:8], "big") > 0 else "empty"
+
+cmd = sys.argv[1]
+if cmd == "stun":
+    # Positive control first: a local responder proves the probe can see a reply at all.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    def answer():
+        data, peer = srv.recvfrom(2048)
+        srv.sendto(b"\x01\x01" + data[2:], peer)
+    threading.Thread(target=answer, daemon=True).start()
+    req = STUN + os.urandom(12)
+    print(udp("127.0.0.1", srv.getsockname()[1], req, want=stun_ok),
+          udp("stun.l.google.com", 19302, STUN + os.urandom(12), want=stun_ok))
+elif cmd == "dns":
+    dev = sys.argv[3] if len(sys.argv) > 3 else None
+    print(udp(sys.argv[2], 53, dns_query("example.com"), timeout=10, want=dns_ok, dev=dev))
+elif cmd == "upnp":
+    ssdp = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n"
+    print(udp("239.255.255.250", 1900, ssdp), udp(sys.argv[2], 5351, b"\x00\x00"))
+elif cmd == "conns":
+    # Live TCP connections of your apps to the internet, each matched with its twin on the Tor
+    # TransPort (global mode hands every new connection to it). Prints counts and names only.
+    import ipaddress, subprocess
+    def ss(*a):
+        return subprocess.run(["ss", "-Htn", "state", "established", *a], capture_output=True, text=True).stdout.splitlines()
+    def ep(s):
+        h, p = s.rsplit(":", 1)
+        a = ipaddress.ip_address(h.strip("[]").split("%")[0])
+        return (getattr(a, "ipv4_mapped", None) or a), p
+    def audit():
+        twins = {ep(l.split()[3]) for l in ss("( sport = :%s )" % sys.argv[2])}
+        conns = {}
+        for l in ss("-p"):
+            f = l.split()
+            names = set(l.split(chr(34))[1::2])  # users:(("name",pid=…))
+            if len(f) >= 5 and names and ep(f[3])[0].is_global:
+                conns[ep(f[2])] = (names, ep(f[2]) in twins)
+        return conns
+    conns = audit()
+    odd = {k for k, (_, t) in conns.items() if not t}
+    if odd:  # a connection opening or closing between the two ss reads looks twin-less once
+        import time
+        time.sleep(1)
+        odd &= {k for k, (_, t) in audit().items() if not t}
+    apps = set().union(*(n for n, _ in conns.values()))
+    bad = set().union(*(conns[k][0] for k in odd))
+    print(len(conns), len(conns) - len(odd), ",".join(sorted(bad)) or "-", ",".join(sorted(apps)) or "-")
+elif cmd == "public":
+    import ipaddress, subprocess
+    out = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True).stdout
+    print(" ".join(sorted({l.split()[1] for l in out.splitlines()
+                           if ipaddress.ip_interface(l.split()[3]).ip.is_global})) or "none")
+elif cmd == "policy":
+    import json
+    d = json.load(open(sys.argv[3]))
+    if sys.argv[2] == "chrome":
+        print("ok" if d.get("WebRtcIPHandling") == "disable_non_proxied_udp" else "missing")
+    else:
+        prefs = d.get("policies", {}).get("Preferences", {})
+        need = {"media.peerconnection.ice.proxy_only_if_behind_proxy": True,
+                "media.peerconnection.ice.default_address_only": True,
+                "media.peerconnection.ice.no_host": True,
+                "network.proxy.allow_bypass": False,
+                "network.proxy.failover_direct": False,
+                "network.proxy.socks5_remote_dns": True}
+        miss = [k for k, v in need.items()
+                if prefs.get(k, {}).get("Value") != v or prefs.get(k, {}).get("Status") != "locked"]
+        print("ok" if not miss else "missing " + " ".join(miss))
+'
+probe() { python3 -c "$PROBE" "$@" 2>/dev/null; }
+
+uid=$(id -u "$ENGINE" 2>/dev/null) || uid=""
+global=on
+[ "$(conf_get GLOBAL)" != off ] || global=off
+rotate=$(conf_get ROTATE)
+[[ $rotate =~ ^[0-9]+$ ]] || rotate=10
+
+section "1. Engine"
+for u in hide ip-changer; do
+    if systemctl is-active --quiet "$u"; then ok "$u.service active"; else bad "$u.service not active"; fi
+done
+if [ -z "$uid" ]; then
+    bad "no '$ENGINE' user (setup.sh install not run?)"
+else
+    for p in 9050 9060 9070 9080 9090 9040; do
+        if ss -Hltne "sport = :$p" | grep -q "uid:$uid "; then ok "tcp $p listening, owned by $ENGINE"; else bad "tcp $p not listening as $ENGINE"; fi
+    done
+    if ss -Hlune 'sport = :9053' | grep -q "uid:$uid "; then ok "udp 9053 (DNS) listening, owned by $ENGINE"; else bad "udp 9053 not listening as $ENGINE"; fi
+    # Global mode exempts this uid: nothing else may run under it.
+    stray=0
+    for pid in $(pgrep -u "$ENGINE"); do grep -q 'ip-changer.service' "/proc/$pid/cgroup" 2>/dev/null || stray=$((stray + 1)); done
+    if [ "$stray" = 0 ]; then ok "only ip-changer.service runs as $ENGINE (the one uid allowed out directly)"; else bad "$stray process(es) run as $ENGINE outside ip-changer.service — they bypass global mode"; fi
+fi
+
+section "2. SOCKS ports (proxy-aware apps, browsers via global-proxy)"
+declare -A exits=()
+for p in 9050 9060 9070 9080 9090; do
+    if ip=$(tor_ip curl --socks5-hostname "127.0.0.1:$p"); then ok "socks $p → Tor exit $ip" && exits[$ip]=1; else bad "socks $p: not through Tor"; fi
+done
+[ "${#exits[@]}" -le 1 ] || ok "${#exits[@]} different exits across the 5 ports"
+if [ "$rotation" = 1 ]; then
+    if a=$(tor_ip curl --socks5-hostname 127.0.0.1:9050); then
+        echo "  … waiting $((rotate + 5))s for a rotation (ROTATE=$rotate)"
+        sleep $((rotate + 5))
+        if b=$(tor_ip curl --socks5-hostname 127.0.0.1:9050); then
+            if [ "$a" != "$b" ]; then ok "exit rotated: $a → $b"; else meh "same exit after ${rotate}s ($a): Tor may pick the same exit again; rerun"; fi
+        else bad "rotation: no Tor answer the second time"; fi
+    else bad "rotation: not through Tor"; fi
+fi
+
+section "3. proxychains (your 127.0.0.1:49374 error)"
+pc=$(command -v proxychains4 || command -v proxychains || true)
+if [ -z "$pc" ]; then
+    bad "proxychains not installed"
+else
+    if ip=$(tor_ip "$pc" -q curl); then ok "proxychains curl → Tor exit $ip"; else bad "proxychains curl: not through Tor"; fi
+    port=$((20000 + RANDOM % 20000))
+    www=$(mktemp -d)
+    python3 -m http.server --bind 127.0.0.1 --directory "$www" "$port" >/dev/null 2>&1 &
+    srv=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :$port" | grep -q . && break; sleep 0.3; done
+    code=$("$pc" -q curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port/" 2>/dev/null)
+    kill "$srv" 2>/dev/null
+    rmdir "$www"
+    if [ "$code" = 200 ]; then ok "app's own localhost server still reachable under proxychains (localnet)"; else bad "localhost through proxychains: HTTP '${code:-none}' (the 49374 error)"; fi
+fi
+
+section "4. Tor jail (hide run / jailed launchers)"
+if ! command -v hide >/dev/null; then
+    bad "hide not installed"
+else
+    if ip=$(tor_ip hide run curl); then ok "hide run curl → Tor exit $ip"; else bad "hide run curl: not through Tor"; fi
+    n=0
+    for p in 9050 9060 9070 9080 9090; do tor_ip hide run curl --socks5-hostname "127.0.0.1:$p" >/dev/null && n=$((n + 1)); done
+    if [ "$n" = 5 ]; then ok "proxy settings work in the jail (127.0.0.1:9050-9090 → Tor SOCKS)"
+    else bad "$n/5 SOCKS ports reachable from the jail: jailed browsers/Electron apps using global-proxy won't load"; fi
+    r=$(hide run python3 -c "$PROBE" dns 127.0.0.53 2>/dev/null)
+    if [ "$r" = answer ]; then ok "DNS works inside the jail (resolv.conf 127.0.0.53 → Tor DNSPort)"; else bad "DNS in the jail: ${r:-no answer}"; fi
+    addrs=$(hide run ip -o addr show 2>/dev/null | awk '{print $4}')
+    n=$(grep -cvx -e 127.0.0.1/8 -e 10.233.233.2/30 <<<"$addrs")
+    if ! grep -qx 10.233.233.2/30 <<<"$addrs"; then bad "couldn't list addresses inside the jail"
+    elif [ "$n" = 0 ]; then ok "jailed apps see no real address (only 127.0.0.1 and 10.233.233.2)"
+    else bad "jailed apps see $n other address(es)"; fi
+    read -r control stun <<<"$(hide run python3 -c "$PROBE" stun 2>/dev/null)"
+    if [ "${control:-}" != reply ]; then bad "STUN probe self-check failed (${control:-no output}): can't judge"
+    elif [ "$stun" = reply ]; then bad "STUN (WebRTC-style UDP) got an answer from the internet: LEAK"
+    else ok "STUN (WebRTC-style UDP) gets nothing ($stun); the probe's local control got its reply"; fi
+    if hide run curl -6 -s --max-time 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>/dev/null; then bad "IPv6 works from the jail"; else ok "no IPv6 from the jail"; fi
+    gw=$(ip -4 route show default | awk '{print $3; exit}')
+    if [ -z "$gw" ]; then skp "LAN check: no default gateway"
+    elif hide run curl -s --max-time 8 -o /dev/null "http://$gw/" 2>/dev/null; then bad "the jail reached your router (LAN)"
+    else ok "LAN (your router) unreachable from the jail"; fi
+    if ip rule show | grep -q 'iif hide0 lookup 233' && ip route show table 233 | grep -q '^unreachable default'; then
+        ok "routing guard present: jail packets can't be forwarded even if nftables is flushed"
+    else bad "routing guard missing (ip rule iif hide0 lookup 233 / unreachable default)"; fi
+fi
+
+section "5. Global mode ($global)"
+if [ "$global" = off ]; then
+    skp "GLOBAL=off in $CONF: only jailed apps and proxy users are protected"
+else
+    if ip=$(tor_ip curl --noproxy '*'); then ok "you, no proxy settings → Tor exit $ip"; else bad "you, no proxy: not through Tor"; fi
+    if sudo -n true 2>/dev/null; then
+        if ip=$(tor_ip sudo -n curl --noproxy '*'); then ok "root, no proxy settings → Tor exit $ip"; else bad "root, no proxy: not through Tor"; fi
+    else skp "root check needs sudo"; fi
+    r=$(probe dns 192.0.2.1)
+    if [ "$r" = answer ]; then ok "DNS to any server is answered by Tor (query to unroutable 192.0.2.1 answered)"; else bad "DNS capture: ${r:-no answer}"; fi
+    # systemd-resolved pins its upstream sockets to the card; a redirect to 127.0.0.1 broke all DNS.
+    dev=$(ip -4 route show default | awk '{print $5; exit}')
+    if [ -n "$dev" ]; then
+        r=$(probe dns 192.0.2.1 "$dev")
+        if [ "$r" = answer ]; then ok "DNS from a socket pinned to $dev (how systemd-resolved sends) is answered too"
+        else bad "DNS pinned to $dev: ${r:-no answer} — every name lookup on this machine fails"; fi
+    fi
+    read -r control stun <<<"$(probe stun)"
+    if [ "${control:-}" != reply ]; then bad "STUN probe self-check failed (${control:-no output})"
+    elif [ "$stun" = eperm ]; then ok "STUN (WebRTC-style UDP) refused by the kernel (EPERM)"
+    else bad "STUN: $stun (expected EPERM)"; fi
+    if curl -6 -s --max-time 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>/dev/null; then bad "IPv6 reaches the internet"; else ok "no IPv6 to the internet"; fi
+    if gw=$(ip -4 route show default | awk '{print $3; exit}') && [ -n "$gw" ]; then
+        r=$(probe upnp "$gw")
+        if [ "$r" = "eperm eperm" ]; then ok "UPnP/NAT-PMP blocked (apps can't ask the router for your public IP)"; else bad "UPnP/NAT-PMP: $r (expected eperm eperm)"; fi
+    fi
+    read -r total via odd apps <<<"$(probe conns 9040)"
+    if [ -z "${apps:-}" ]; then bad "connection audit (ss) failed: can't judge"
+    elif [ "$total" = "$via" ]; then ok "all $total live internet connection(s) of your apps go through Tor ($apps)"
+    else meh "$((total - via)) live connection(s) don't go through Tor ($odd): opened before global mode? the firewall drops them; restart those apps"; fi
+    r=$(probe public)
+    if [ "$r" = none ]; then ok "no public address on any interface for apps to read"
+    elif [ -z "$r" ]; then bad "public-address probe failed: can't judge"
+    else bad "interface(s) $r hold a public address apps can read directly — see HIDE.md (IPv6)"; fi
+    if [ "$docker" = 1 ]; then
+        if ! command -v docker >/dev/null; then skp "docker not installed"
+        elif ip=$(tor_ip docker run --rm --network bridge curlimages/curl); then ok "docker container (bridge) → Tor exit $ip"
+        else bad "docker container: not through Tor"; fi
+    fi
+fi
+
+section "6. Browser WebRTC policies"
+for f in /etc/opt/chrome/policies/managed/hide-webrtc.json /etc/chromium/policies/managed/hide-webrtc.json \
+    /etc/chromium-browser/policies/managed/hide-webrtc.json /etc/brave/policies/managed/hide-webrtc.json; do
+    if [ ! -f "$f" ]; then bad "$f missing"; elif [ "$(probe policy chrome "$f")" = ok ]; then ok "$f"; else bad "$f invalid"; fi
+done
+f=/etc/firefox/policies/policies.json
+if [ ! -f "$f" ]; then bad "$f missing"; else
+    r=$(probe policy firefox "$f")
+    if [ "$r" = ok ]; then ok "$f: WebRTC + proxy prefs locked"; else bad "$f: ${r:-invalid JSON}"; fi
+fi
+
+if [ "$full" = 1 ]; then
+    section "7. Fail-closed: Tor engine stopped"
+    if ! sudo -n true 2>/dev/null; then
+        skp "needs sudo"
+    else
+        trap 'sudo -n systemctl start ip-changer' EXIT
+        sudo -n systemctl stop ip-changer
+        closed "jail" hide run curl
+        if [ "$global" = on ]; then closed "global, no proxy" curl --noproxy '*'; fi
+        sudo -n systemctl start ip-changer
+        trap - EXIT
+        echo "  … restarting Tor"
+        up=0 end=$((SECONDS + 180))
+        while [ "$SECONDS" -lt "$end" ]; do
+            if tor_ip curl --socks5-hostname 127.0.0.1:9050 >/dev/null && tor_ip hide run curl >/dev/null; then up=1 && break; fi
+            sleep 5
+        done
+        if [ "$up" = 1 ]; then ok "back on Tor after restart"; else bad "Tor not back within 3 minutes"; fi
+    fi
+fi
+
+printf '\n%d passed, %d failed, %d warnings, %d skipped\n' "$pass" "$fail" "$warn" "$skip"
+[ "$fail" = 0 ]
