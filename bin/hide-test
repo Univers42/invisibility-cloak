@@ -182,9 +182,15 @@ else
         if ss -Hltne "sport = :$p" | grep -q "uid:$uid "; then ok "tcp $p listening, owned by $ENGINE"; else bad "tcp $p not listening as $ENGINE"; fi
     done
     if ss -Hlune 'sport = :9053' | grep -q "uid:$uid "; then ok "udp 9053 (DNS) listening, owned by $ENGINE"; else bad "udp 9053 not listening as $ENGINE"; fi
-    # Global mode exempts this uid: nothing else may run under it.
-    stray=0
-    for pid in $(pgrep -u "$ENGINE"); do grep -q 'ip-changer.service' "/proc/$pid/cgroup" 2>/dev/null || stray=$((stray + 1)); done
+    # Global mode exempts this uid: nothing else on this machine's network may run under it.
+    # A container's process with the same uid number has its own network: not exempt, not counted.
+    stray=0 hostns=$(readlink /proc/self/ns/net)
+    for pid in $(pgrep -u "$ENGINE"); do
+        grep -q 'ip-changer.service' "/proc/$pid/cgroup" 2>/dev/null && continue
+        ns=$(readlink "/proc/$pid/ns/net" 2>/dev/null || sudo -n readlink "/proc/$pid/ns/net" 2>/dev/null) || ns=""
+        if [ -n "$ns" ] && [ "$ns" != "$hostns" ]; then continue; fi
+        [ -e "/proc/$pid" ] && stray=$((stray + 1))
+    done
     if [ "$stray" = 0 ]; then ok "only ip-changer.service runs as $ENGINE (the one uid allowed out directly)"; else bad "$stray process(es) run as $ENGINE outside ip-changer.service — they bypass global mode"; fi
 fi
 
