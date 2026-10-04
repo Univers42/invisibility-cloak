@@ -252,7 +252,8 @@ run() {
     [ $# -gt 0 ] || die "usage: hide run <command> [args…]"
     check_outside "$strict" "$@"
     local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hide"
-    mkdir -p "$dir" && chmod 700 "$dir"
+    # No login session (su, cron, a container) means no runtime dir: mktemp's file is private anywhere.
+    if ! { mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir"; }; then dir=${TMPDIR:-/tmp}; fi
     RUN_FILE=$(mktemp "$dir/run.XXXXXX")
     trap 'rm -f "$RUN_FILE"' EXIT
     # Your environment travels in a private file, not on sudo's command line (which is logged).
