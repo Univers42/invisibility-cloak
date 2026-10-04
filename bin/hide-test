@@ -32,6 +32,10 @@ meh() { warn=$((warn + 1)) && printf '  \e[33mWARN\e[0m %s\n' "$*"; }
 skp() { skip=$((skip + 1)) && printf '  SKIP %s\n' "$*"; }
 section() { printf '\n\e[1m%s\e[0m\n' "$*"; }
 conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n1 | tr -d '"'; }
+# Where this machine's internet goes: the network card (dev) and the router (via), if any.
+route=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1)
+dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route")
+gw=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<<"$route")
 
 # Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true.
 tor_ip() {
@@ -68,7 +72,10 @@ def udp(host, port, payload, timeout=4, want=None, dev=None):
     s.settimeout(timeout)
     try:
         if dev:  # pinned to one network card, as systemd-resolved does
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+            except PermissionError:  # before Linux 5.7 only root may pin a socket
+                return "nobind"
         s.sendto(payload, addr)
         if want is None:
             return "sent"
@@ -197,7 +204,7 @@ if [ "$rotation" = 1 ]; then
     else bad "rotation: not through Tor"; fi
 fi
 
-section "3. proxychains (your 127.0.0.1:49374 error)"
+section "3. proxychains (terminal apps: proxychains4 <cmd>)"
 pc=$(command -v proxychains4 || command -v proxychains || true)
 if [ -z "$pc" ]; then
     bad "proxychains not installed"
@@ -211,7 +218,7 @@ else
     code=$("$pc" -q curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$port/" 2>/dev/null)
     kill "$srv" 2>/dev/null
     rmdir "$www"
-    if [ "$code" = 200 ]; then ok "app's own localhost server still reachable under proxychains (localnet)"; else bad "localhost through proxychains: HTTP '${code:-none}' (the 49374 error)"; fi
+    if [ "$code" = 200 ]; then ok "app's own localhost server still reachable under proxychains (localnet)"; else bad "localhost through proxychains: HTTP '${code:-none}' (apps' own local helpers break)"; fi
 fi
 
 section "4. Tor jail (hide run / jailed launchers)"
@@ -223,8 +230,15 @@ else
     for p in 9050 9060 9070 9080 9090; do tor_ip hide run curl --socks5-hostname "127.0.0.1:$p" >/dev/null && n=$((n + 1)); done
     if [ "$n" = 5 ]; then ok "proxy settings work in the jail (127.0.0.1:9050-9090 → Tor SOCKS)"
     else bad "$n/5 SOCKS ports reachable from the jail: jailed browsers/Electron apps using global-proxy won't load"; fi
-    r=$(hide run python3 -c "$PROBE" dns 127.0.0.53 2>/dev/null)
-    if [ "$r" = answer ]; then ok "DNS works inside the jail (resolv.conf 127.0.0.53 → Tor DNSPort)"; else bad "DNS in the jail: ${r:-no answer}"; fi
+    ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+    if [ -z "$ns" ]; then skp "DNS in the jail: no IPv4 nameserver in /etc/resolv.conf to ask"
+    else
+        r=$(hide run python3 -c "$PROBE" dns "$ns" 2>/dev/null)
+        if [ "$r" = answer ]; then ok "DNS works inside the jail (resolv.conf's $ns → Tor DNSPort)"; else bad "DNS in the jail: ${r:-no answer}"; fi
+    fi
+    if [ "$global" = off ] && { grep -Eqs '^hosts:.*[[:space:]]resolve' /etc/nsswitch.conf || [ -S /run/nscd/socket ]; }; then
+        meh "apps here look names up through a local socket (nss-resolve or nscd) the jail can't redirect: your DNS server sees jailed apps' lookups (not their traffic). Global mode closes this"
+    fi
     addrs=$(hide run ip -o addr show 2>/dev/null | awk '{print $4}')
     n=$(grep -cvx -e 127.0.0.1/8 -e 10.233.233.2/30 <<<"$addrs")
     if ! grep -qx 10.233.233.2/30 <<<"$addrs"; then bad "couldn't list addresses inside the jail"
@@ -235,7 +249,6 @@ else
     elif [ "$stun" = reply ]; then bad "STUN (WebRTC-style UDP) got an answer from the internet: LEAK"
     else ok "STUN (WebRTC-style UDP) gets nothing ($stun); the probe's local control got its reply"; fi
     if hide run curl -6 -s --max-time 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>/dev/null; then bad "IPv6 works from the jail"; else ok "no IPv6 from the jail"; fi
-    gw=$(ip -4 route show default | awk '{print $3; exit}')
     if [ -z "$gw" ]; then skp "LAN check: no default gateway"
     elif hide run curl -s --max-time 8 -o /dev/null "http://$gw/" 2>/dev/null; then bad "the jail reached your router (LAN)"
     else ok "LAN (your router) unreachable from the jail"; fi
@@ -255,10 +268,10 @@ else
     r=$(probe dns 192.0.2.1)
     if [ "$r" = answer ]; then ok "DNS to any server is answered by Tor (query to unroutable 192.0.2.1 answered)"; else bad "DNS capture: ${r:-no answer}"; fi
     # systemd-resolved pins its upstream sockets to the card; a redirect to 127.0.0.1 broke all DNS.
-    dev=$(ip -4 route show default | awk '{print $5; exit}')
     if [ -n "$dev" ]; then
         r=$(probe dns 192.0.2.1 "$dev")
         if [ "$r" = answer ]; then ok "DNS from a socket pinned to $dev (how systemd-resolved sends) is answered too"
+        elif [ "$r" = nobind ]; then skp "DNS pinned to $dev: this kernel lets only root pin a socket to a card"
         else bad "DNS pinned to $dev: ${r:-no answer} — every name lookup on this machine fails"; fi
     fi
     read -r control stun <<<"$(probe stun)"
@@ -266,7 +279,7 @@ else
     elif [ "$stun" = eperm ]; then ok "STUN (WebRTC-style UDP) refused by the kernel (EPERM)"
     else bad "STUN: $stun (expected EPERM)"; fi
     if curl -6 -s --max-time 8 -o /dev/null 'https://[2606:4700:4700::1111]/' 2>/dev/null; then bad "IPv6 reaches the internet"; else ok "no IPv6 to the internet"; fi
-    if gw=$(ip -4 route show default | awk '{print $3; exit}') && [ -n "$gw" ]; then
+    if [ -n "$gw" ]; then
         r=$(probe upnp "$gw")
         if [ "$r" = "eperm eperm" ]; then ok "UPnP/NAT-PMP blocked (apps can't ask the router for your public IP)"; else bad "UPnP/NAT-PMP: $r (expected eperm eperm)"; fi
     fi
