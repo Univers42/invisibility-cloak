@@ -175,6 +175,10 @@ section "1. Engine"
 for u in hide ip-changer; do
     if systemctl is-active --quiet "$u"; then ok "$u.service active"; else bad "$u.service not active"; fi
 done
+# Tor opens its ports before it has connected: just after a start, a FAIL below can mean "not yet".
+t=$(systemctl show --value -p ActiveEnterTimestampMonotonic ip-changer 2>/dev/null)
+age=$(($(cut -d. -f1 /proc/uptime) - ${t:-0} / 1000000))
+if [[ $t =~ ^[1-9][0-9]*$ ]] && ((age < 180)); then meh "ip-changer started ${age}s ago: Tor may still be connecting, and a FAIL below can just mean \"not yet\". Re-run in 2 minutes"; fi
 if [ -z "$uid" ]; then
     bad "no '$ENGINE' user (setup.sh install not run?)"
 else

@@ -415,7 +415,7 @@ install_all() {
     say "done"
     as_user "$HIDE" status
     if [ "$global" = off ]; then echo "Global mode is off: proxy-aware and jailed apps use Tor. Everything: hide global on"; fi
-    echo "Verify: hide-test   (more: hide-test --rotation --full)"
+    echo "Verify: hide-test   (give Tor 2 minutes to connect first; more: hide-test --rotation --full)"
     echo "Offline after a change? hide-rescue  (puts the internet back, needs no network)"
 }
 
