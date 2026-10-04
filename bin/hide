@@ -5,6 +5,8 @@
 #   hide run <cmd> [args…]       run one command inside the Tor jail
 #   hide add [<app>]             make an app's launcher always start in the jail (no arg: list)
 #   hide remove <app>|--all      undo `hide add`
+#   hide bridges snowflake|obfs4|FILE|off   reach Tor on a network that blocks it (asks for sudo)
+#   hide check-rules             can this kernel run hide? tests every rule, loads nothing (sudo)
 #   hide apply|teardown          root, used by hide.service: build / remove the kernel rules
 # How it works and what it can't do: /usr/local/share/doc/hide/HIDE.md
 set -euo pipefail
@@ -30,6 +32,7 @@ die() {
 }
 
 conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n1 | tr -d '"'; }
+conf_set() { if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=$2|" "$CONF"; else echo "$1=$2" >>"$CONF"; fi; }
 
 # Anything but an explicit "off" means on: a typo must not open the machine up.
 global_mode() { if [ "$(conf_get GLOBAL)" = off ]; then echo off; else echo on; fi; }
@@ -38,12 +41,12 @@ global_mode() { if [ "$(conf_get GLOBAL)" = off ]; then echo off; else echo on; 
 
 # One nftables table, replaced atomically. Lines starting with @G only exist in global mode.
 ruleset() {
-    local uid=$1
-    cat <<EOF | if [ "$(global_mode)" = on ]; then sed 's/^@G/  /'; else sed '/^@G/d'; fi
+    local uid=$1 mode=$2
+    cat <<EOF | if [ "$mode" = on ]; then sed 's/^@G/  /'; else sed '/^@G/d'; fi
 table inet hide
 delete table inet hide
 table inet hide {
-    set local4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } }
+    set local4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } }
     set local6 { type ipv6_addr; flags interval; elements = { ::1, fc00::/7, fe80::/10, ff00::/8 } }
 
     # The jail (always) and containers/VMs (global): TCP -> Tor TransPort, DNS -> Tor DNSPort.
@@ -118,11 +121,19 @@ jail_up() {
     ip -n "$NS" link set lo up
     ip -n "$NS" link set "$JAIL_IF" up
     ip -n "$NS" route replace default via "$HOST_IP"
-    # No IPv6 in the jail. route_localnet lets the rules below send 127.x packets out.
-    ip netns exec "$NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 "net.ipv4.conf.$JAIL_IF.route_localnet=1"
-    # Apps resolve through /etc/resolv.conf = 127.0.0.53 and proxy to 127.0.0.1:9050…, which
-    # inside the jail is the jail's own loopback: hand both to Tor on the host side.
-    ip netns exec "$NS" nft -f - <<EOF
+    # No IPv6 in the jail (-e: a kernel booted with ipv6.disable=1 has none to switch off).
+    # route_localnet lets the rules below send 127.x packets out.
+    ip netns exec "$NS" sysctl -qew net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 "net.ipv4.conf.$JAIL_IF.route_localnet=1"
+    jail_rules | ip netns exec "$NS" nft -f -
+    # Fail-closed even if nftables gets flushed: jail packets are never routed onward.
+    ip route replace unreachable default table "$RT_TABLE"
+    ip rule show | grep -q "iif $HOST_IF lookup $RT_TABLE" || ip rule add iif "$HOST_IF" priority 100 lookup "$RT_TABLE"
+}
+
+# Inside the jail. A local resolver from /etc/resolv.conf (127.0.0.53, 127.0.1.1, 127.0.0.1…)
+# and the proxy at 127.0.0.1:9050… would be the jail's own loopback: hand both to Tor.
+jail_rules() {
+    cat <<EOF
 table ip hidejail
 delete table ip hidejail
 table ip hidejail {
@@ -137,17 +148,24 @@ table ip hidejail {
     }
 }
 EOF
-    # Fail-closed even if nftables gets flushed: jail packets are never routed onward.
-    ip route replace unreachable default table "$RT_TABLE"
-    ip rule show | grep -q "iif $HOST_IF lookup $RT_TABLE" || ip rule add iif "$HOST_IF" priority 100 lookup "$RT_TABLE"
 }
 
 apply() {
     [ "$(id -u)" -eq 0 ] || die "apply needs root (hide.service runs it)"
     local uid
     uid=$(id -u "$ENGINE") || die "no '$ENGINE' user: run setup.sh install"
-    ruleset "$uid" | nft -f -
+    ruleset "$uid" "$(global_mode)" | nft -f -
     jail_up
+}
+
+# Does this kernel + nft accept every rule (global mode included)? nft -c loads nothing.
+check_rules() {
+    [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" check-rules
+    local uid
+    uid=$(id -u "$ENGINE" 2>/dev/null) || uid=0
+    ruleset "$uid" on | nft -c -f - || die "this kernel or nft version rejects the global rules (needs Linux >= 5.2, nftables >= 0.9.3)"
+    jail_rules | nft -c -f - || die "this kernel or nft version rejects the jail rules"
+    echo "rules: this kernel accepts all of them (global mode and jail)."
 }
 
 teardown() {
@@ -162,9 +180,42 @@ teardown() {
 global() {
     case "${1:-}" in on | off) ;; *) die "usage: hide global on|off" ;; esac
     [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" global "$1"
-    if grep -q '^GLOBAL=' "$CONF"; then sed -i "s/^GLOBAL=.*/GLOBAL=$1/" "$CONF"; else echo "GLOBAL=$1" >>"$CONF"; fi
+    conf_set GLOBAL "$1"
     systemctl reload-or-restart hide.service
     echo "global mode $1."
+}
+
+# Bridges for networks that block Tor. A file of your own lines is copied to /etc/hide: the
+# engine can't read your home folder (and you might delete the file).
+bridges() {
+    local v=${1:-} old n
+    case "$v" in
+        off | snowflake | obfs4) ;;
+        "") die "usage: hide bridges snowflake|obfs4|FILE|off" ;;
+        *)
+            [ -f "$v" ] || die "no file '$v': put bridge lines from https://bridges.torproject.org in one"
+            v=$(readlink -f "$v")
+            ;;
+    esac
+    [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" bridges "$v"
+    old=$(conf_get BRIDGES)
+    case "$v" in
+        off) v="" ;;
+        /etc/hide/bridges.txt) ;;
+        /*) install -m 644 "$v" /etc/hide/bridges.txt && v=/etc/hide/bridges.txt ;;
+    esac
+    conf_set BRIDGES "\"$v\""
+    systemctl restart ip-changer.service
+    # A bad bridge setup makes the engine exit within seconds; systemd then restarts it in a loop.
+    n=$(systemctl show -p NRestarts --value ip-changer.service)
+    sleep 4
+    if ! systemctl is-active --quiet ip-changer.service || [ "$(systemctl show -p NRestarts --value ip-changer.service)" != "$n" ]; then
+        journalctl -u ip-changer.service -n 4 --no-pager -o cat >&2
+        conf_set BRIDGES "\"$old\""
+        systemctl restart ip-changer.service
+        die "bridges unchanged (${old:-off})"
+    fi
+    echo "bridges: ${v:-off}. Tor is reconnecting (a few minutes with bridges). Check: hide status"
 }
 
 # ---- the jail, for one command (as you) ------------------------------------
@@ -332,9 +383,20 @@ remove() {
 }
 
 status() {
-    local ip f
-    echo "engine : ip-changer.service $(systemctl is-active ip-changer 2>/dev/null)"
-    echo "rules  : hide.service $(systemctl is-active hide 2>/dev/null), global mode $(global_mode), jail $([ -e "/run/netns/$NS" ] && echo up || echo down)"
+    local ip f r g b
+    b=$(conf_get BRIDGES)
+    echo "engine : ip-changer.service $(systemctl is-active ip-changer 2>/dev/null), bridges ${b:-off}"
+    # Global mode as the kernel does it, not as hide.conf says: a direct request must come out of Tor.
+    g=off
+    if [ "$(global_mode)" = on ]; then
+        r=$(curl -s --max-time 20 --noproxy '*' https://check.torproject.org/api/ip 2>/dev/null) || true
+        case "$r" in
+            *'"IsTor":true'*) g="on (checked: direct traffic leaves through Tor)" ;;
+            *'"IsTor":false'*) g="on in $CONF but NOT in the kernel: your real IP is out! sudo systemctl restart hide" ;;
+            *) g="on, but nothing answers yet (Tor starting, or offline): blocked, not leaking" ;;
+        esac
+    fi
+    echo "rules  : hide.service $(systemctl is-active hide 2>/dev/null), jail $([ -e "/run/netns/$NS" ] && echo up || echo down), global mode $g"
     ip=$(curl -s --max-time 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null |
         sed -n 's/.*"IsTor":true,"IP":"\([^"]*\)".*/\1/p') || true
     if [ -n "$ip" ]; then echo "tor    : Tor exit $ip"; else echo "tor    : not answering on 127.0.0.1:9050"; fi
@@ -349,11 +411,13 @@ global) global "${2:-}" ;;
 run) shift && run "$@" ;;
 add) shift && add "$@" ;;
 remove) shift && remove "$@" ;;
+bridges) bridges "${2:-}" ;;
+check-rules) check_rules ;;
 apply) apply ;;
 teardown) teardown ;;
 __enter) enter "$2" ;;
 *)
-    sed -n '2,9s/^# \{0,1\}//p' "$0" >&2
+    sed -n '2,11s/^# \{0,1\}//p' "$0" >&2
     exit 2
     ;;
 esac
