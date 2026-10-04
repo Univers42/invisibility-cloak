@@ -150,7 +150,7 @@ It never fetches or prints your real IP. A pass is `check.torproject.org` answer
 | 2. SOCKS | all 5 ports reach Tor; how many distinct exits. `--rotation`: the exit changes after `ROTATE` (a WARN if Tor picked the same one) |
 | 3. proxychains | reaches Tor, **and** a local web server is still reachable through it (the 49374 regression test) |
 | 4. Jail | Tor; the 5 SOCKS ports work from inside (proxy settings); DNS works; only jail addresses are visible; STUN/WebRTC UDP gets no answer (with a positive control proving the probe works); no IPv6; your router is unreachable; routing guard present |
-| 5. Global | you and root with no proxy reach Tor; a DNS query to an unroutable address is answered (all DNS captured); STUN, UPnP and NAT-PMP get `EPERM`; no IPv6; no interface holds a public address. `--docker`: a container reaches Tor |
+| 5. Global | you and root with no proxy reach Tor; a DNS query to an unroutable address is answered (all DNS captured), also from a socket pinned to the network card; STUN, UPnP and NAT-PMP get `EPERM`; no IPv6; every live internet connection of your apps has its twin on Tor's TransPort (names the apps, never addresses); no interface holds a public address. `--docker`: a container reaches Tor |
 | 6. Browsers | the policy files exist, parse, and hold the right values |
 | 7. `--full` | stops the engine and checks that jailed and global traffic now **fail** (closed, not direct), then restarts it |
 
@@ -182,6 +182,14 @@ It never fetches or prints your real IP. A pass is `check.torproject.org` answer
 - **`sudo` without a password.** If your account has `NOPASSWD: ALL`, any app you run
   can silently become root and switch all of this off. Remove that line from `/etc/sudoers.d/`.
   hide's own helper has its own narrow rule.
+- **The `docker` and `lxd` groups** are root in all but name: `docker run --network host`
+  leaves the jail, and a privileged container can switch everything off. An app that can
+  run docker (a coding agent in auto mode, say) can escape the jail; global mode still
+  covers its traffic until it uses root.
+- **Command-line apps.** `hide add` rewrites menu launchers only. For a terminal tool use
+  `hide run <tool>`, or rely on global mode. A tool that serves other programs on
+  localhost (an AI agent's local server, say) can't be jailed alone: whatever talks to it
+  from outside the jail no longer reaches it.
 - **Who you are, as opposed to where you are.** Logins, cookies, browser fingerprinting
   and the content you post identify you whatever your IP. Use separate profiles or
   containers for identities you want kept apart.
