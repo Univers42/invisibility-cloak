@@ -99,6 +99,8 @@ watches the exit change. `hide-test --full` stops Tor and checks that everything
 | `hide run firefox` | run one command inside the Tor jail |
 | `hide add` / `hide add discord` | list your apps / make one always start in the jail |
 | `hide remove discord` | undo that |
+| `hide fast add youtube` / `discord` | let a site or an app skip Tor: fast video, calls, games ([see below](#-fast-lane-youtube-calls-and-games)) |
+| `hide fast off` | everything back on Tor |
 | `hide bridges obfs4` | your network blocks Tor? Sneak in (see below) |
 | `hide-test` | prove it works |
 | `journalctl -fu ip-changer` | watch Tor's log live |
@@ -124,13 +126,49 @@ Honesty corner. Global mode is strict on purpose, so:
   answer with a 403 or an endless captcha. Do a `hide global off`, do your thing, then
   `hide global on`.
 - **Anything that needs UDP:** voice and video calls (they fall back to TCP or fail),
-  online games, WireGuard/OpenVPN over UDP, and NTP (your clock drifts slowly).
+  online games, WireGuard/OpenVPN over UDP, and NTP (your clock drifts slowly). Calls and
+  games work again in the fast lane, just below.
 - **Captive-portal Wi-Fi** (hotels, trains): turn global mode off to log in.
 - **Speed:** everything takes the scenic route through 3 relays. Seconds, not milliseconds.
 - **Boards without a clock battery** (Raspberry Pi): they boot in the past, and Tor won't
   start until the clock is right. Keep global mode off on those, or set the time first.
 
 The full list, and the reasons behind it: [docs/HIDE.md](docs/HIDE.md#what-global-mode-breaks-honest-list).
+
+## 🚀 Fast lane: YouTube, calls and games
+
+Tor makes video crawl and can't carry UDP, so calls and games fail. The fast lane lets
+**the sites and apps you pick** skip Tor. Everything else stays on Tor.
+
+```bash
+hide fast add youtube     # YouTube's pages and video servers go direct in your browsers
+hide fast add twitch      # same for Twitch (or any domain: hide fast add example.org)
+hide fast add discord     # Discord starts outside Tor from its menu entry: calls work
+hide fast run ./mygame    # one command outside Tor
+hide fast                 # what's in the lane
+hide fast off             # close it: everything back on Tor
+```
+
+```
+ browser ───► fast proxy 127.0.0.1:9049 ──┬── youtube.com, twitch.tv… ──► direct, fast
+                                          └── every other site ─────────► Tor
+ hide fast run discord ───────────────────── TCP + UDP ─────────────────► direct
+ everything else ───────────────────────────────────────────────────────► Tor
+```
+
+> ⚠️ **The price:** what's in the lane sees your real IP. YouTube (so Google), Twitch,
+> Discord and the game servers know where you are. And while an app is in the lane, any
+> program running as you could slip into it too. Keep it closed when you don't need it:
+> `hide fast off`.
+
+- A site goes direct only when you ask for it by name, on the web ports, and only when
+  the name points to the internet (never your LAN). Any other site sent to the fast proxy
+  goes on to Tor, and your DNS lookups still go through Tor.
+- It works in the browsers `global-proxy` sets up: Chrome on KDE or GNOME, and Firefox.
+  Restart the browser after the first `hide fast add`.
+- A jailed app can never use the lane, and `hide-test` checks all of this.
+
+How it works, rule by rule: [docs/HIDE.md](docs/HIDE.md#5-the-fast-lane--hide-fast-off-until-you-use-it).
 
 ## 🧱 Censored network?
 
@@ -177,6 +215,7 @@ On Arch the obfs4 program came from Tor's own expert bundle, standing in for the
 | your LAN, router and public address, from jailed apps | anything if your account has `NOPASSWD: ALL` sudo: any app can turn hide off |
 | containers' and VMs' traffic (global mode, NAT networking) | membership in the `docker`/`lxd` groups, which is root by another name |
 | | VMs on a *bridged* adapter and macvlan containers: they skip the host's firewall |
+| | whatever you put in the 🚀 fast lane: it skips Tor on purpose |
 
 Tor hides **where** you are, not **who** you are. If you log into your account, the site
 knows it's you, whatever IP you come from.
@@ -225,10 +264,12 @@ what you *do* through Tor is still covered by the law where you are. Check your 
 your habits: see the table above.
 
 **Why is everything slower?** Your traffic hops through 3 volunteer relays around the
-world. That's the price of the cloak.
+world. That's the price of the cloak. For video, calls and games there's the
+[🚀 fast lane](#-fast-lane-youtube-calls-and-games), which skips Tor for those only.
 
-**Why 5 Tor instances?** Firefox spreads its tabs over them (and proxychains its
-connections), so one slow circuit doesn't stall everything, and sites see different exits.
+**Why 5 Tor instances?** proxychains picks one at random for each connection, so one slow
+circuit doesn't stall everything and sites see different exits. Firefox moves on to the
+next one if one stops answering.
 
 **Can I use a VPN too?** A VPN over TCP works in global mode; it then runs *inside* Tor.
 UDP VPNs (WireGuard) are blocked by global mode.
@@ -255,14 +296,15 @@ flowchart TD
     C -->|"Termux, no systemd or no sudo"| L0["🧦 Level 0: Tor proxies only<br/>curl test, done"]
     C -->|"systemd + sudo"| D{"🧪 Dry run<br/>setup.sh check"}
     D -->|"FAIL"| X["🛑 Stop and report"]
-    D -->|"OK"| Q["🙋 Ask you: jail only or global mode?<br/>Tor blocked here? Bridges"]
+    D -->|"OK"| Q["🙋 Ask you: jail only or global mode?<br/>Tor blocked here? Bridges<br/>A fast lane for video and calls?"]
     Q --> I["⚙️ Install, jail only first"]
     I --> P{"✅ Prove it<br/>hide-test"}
     P -->|"FAIL"| X
-    P -->|"0 failed, jail only"| T["🎓 Teach you the 5 commands"]
+    P -->|"0 failed, jail only"| F["🚀 Fast lane, if you want it<br/>hide fast add youtube"]
+    F --> T["🎓 Teach you the everyday commands"]
     P -->|"0 failed, you want global"| R["🛟 Arm the safety net<br/>hide-rescue --in 10m"]
     R --> G{"🧥 hide global on<br/>hide-test again"}
-    G -->|"0 failed"| T
+    G -->|"0 failed"| F
     G -->|"FAIL, or the AI loses contact"| Y["⏲️ 10 min later, global mode<br/>switches itself off"]
 ```
 
@@ -324,7 +366,7 @@ at a time. Start by explaining this plan to me in 5 short lines.
      install and change: packages, two boot services, kernel firewall rules, browser
      policies, the proxychains config, desktop proxy settings, a sudoers drop-in.
      Never pipe a download into bash.
-   - LEVEL 0 ends in this step, then jump to step 9:
+   - LEVEL 0 ends in this step, then jump to step 10:
      Termux: ask, then run: bash installer.sh
        It installs tor, curl, netcat, procps and the bridge programs (lyrebird, snowflake)
        with pkg, and adds the command ip-changer.
@@ -353,7 +395,7 @@ at a time. Start by explaining this plan to me in 5 short lines.
      port is taken by another program): STOP. Show me the exact lines, explain them, point
      me to docs/HIDE.md "Troubleshooting", and let me decide. Don't work around it.
 
-4. ASK ME TWO QUESTIONS. Explain first, then wait for my answers.
+4. ASK ME THREE QUESTIONS. Explain first, then wait for my answers.
    a) Jail only, or the whole machine (global mode)? What global mode breaks:
       - sites that hate Tor: some banks, streaming services, shops, even claude.ai's web app
         (a 403 or an endless captcha). Switch it off, do the thing, switch it back on.
@@ -371,6 +413,11 @@ at a time. Start by explaining this plan to me in 5 short lines.
       obfs4, snowflake-pt-client for snowflake): I install one with my AUR helper first.
       Fedora and openSUSE have no snowflake client package: use obfs4 (openSUSE's
       "snowflake" package is the volunteer proxy, not the client: don't install it).
+   c) Do I want a fast lane? Through Tor, YouTube and Twitch are slow, and calls (Discord)
+      and online games fail (no UDP). The fast lane lets the sites and apps I name skip
+      Tor, and only those. The price, say it plainly: they see my real IP, and while an
+      app is in the lane, any program running as me could slip into it too. Not sure? No
+      fast lane; I can add one any time.
 
 5. SAFETY NET. Explain it to me before anything touches the network:
    - hide-rescue gets the internet back in seconds and needs no network: global mode off,
@@ -422,28 +469,40 @@ at a time. Start by explaining this plan to me in 5 short lines.
    - Want more proof? hide-test --rotation (the Tor exit changes), hide-test --full (stops
      Tor and checks that everything fails instead of going direct; needs sudo).
 
-8. TEACH ME the 5 everyday commands:
+8. FAST LANE, only if I said yes in 4c. Ask before each command (they use sudo):
+     hide fast add youtube     a site: YouTube's pages and video servers skip Tor
+     hide fast add twitch      same for Twitch; any domain works too (example.org)
+     hide fast add discord     an app: its menu entry now starts it outside Tor
+     hide fast                 shows what's in the lane
+   An app name must be one from hide add's list. Then tell me to restart my browsers (they
+   read the proxy setting at startup) and to quit an app fully before starting it again
+   from its menu. Run hide-test again: its section 7 checks the lane, and the last line
+   must still say "0 failed". Only the sites and apps I named may go direct.
+
+9. TEACH ME the everyday commands:
      hide                   what's on, and whether Tor answers
      hide global on / off   the whole machine through Tor, or back to normal
      hide run firefox       run one command inside the Tor jail
      hide add discord       always start that app in the jail (hide add alone lists my
                             apps; undo: hide remove discord)
+     hide fast add youtube  let a site or an app skip Tor: fast, but it sees my real IP
+                            (hide fast off closes the lane)
      hide-test              prove it works
    Plus: offline? hide-rescue (works with no network). About to try something risky?
    hide-rescue --in 5m first. Remove everything:
      cd ~/.local/share/invisibility-cloak && sudo ./setup.sh uninstall
 
-9. FINAL SUMMARY, in plain words:
-   - what's installed: the level, global mode on or off, bridges or not, and that it starts
-     at boot (level 0: only while ip-changer runs);
+10. FINAL SUMMARY, in plain words:
+   - what's installed: the level, global mode on or off, bridges or not, what's in the
+     fast lane, and that it starts at boot (level 0: only while ip-changer runs);
    - what's hidden: my IP address (in WebRTC too), my DNS lookups, my LAN and router from
      jailed apps, containers' and VMs' traffic in global mode (level 0: only the apps I point
      at the proxy);
-   - what's NOT hidden: who I am (logins, cookies, browser fingerprint, what I write), and
-     an app that's hostile on purpose and gets root. If sudo never asks me for a password
-     (NOPASSWD: ALL), or step 1 showed me in the docker or lxd group, any app can switch
-     hide off: tell me, but change nothing. VMs on a bridged adapter and macvlan containers
-     skip the firewall;
+   - what's NOT hidden: who I am (logins, cookies, browser fingerprint, what I write),
+     whatever is in the fast lane (it sees my real IP), and an app that's hostile on
+     purpose and gets root. If sudo never asks me for a password (NOPASSWD: ALL), or step 1
+     showed me in the docker or lxd group, any app can switch hide off: tell me, but change
+     nothing. VMs on a bridged adapter and macvlan containers skip the firewall;
    - Tor hides WHERE I am, not WHO I am;
    - the last hide-test line, word for word.
 ```
