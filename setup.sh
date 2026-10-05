@@ -70,9 +70,11 @@ FILES=(
     "bin/hide-rescue /usr/local/bin/hide-rescue 755"
     "bin/hide-jail /usr/local/libexec/hide-jail 755"
     "bin/hide-fast-proxy /usr/local/libexec/hide-fast-proxy 755"
+    "bin/hide-dns /usr/local/libexec/hide-dns 755"
     "systemd/ip-changer.service /etc/systemd/system/ip-changer.service 644"
     "systemd/hide.service /etc/systemd/system/hide.service 644"
     "systemd/hide-fast.service /etc/systemd/system/hide-fast.service 644"
+    "systemd/hide-dns.service /etc/systemd/system/hide-dns.service 644"
     "docs/HIDE.md /usr/local/share/doc/hide/HIDE.md 644"
 )
 FIREFOX_PREFS='{
@@ -210,13 +212,14 @@ check() {
         bad=1
     fi
     ip netns del hide-check 2>/dev/null || true
-    # ip-changer's Tor: SOCKS 9050…9090, control 9051…9091, TransPort 9040, DNSPort 9053;
+    # ip-changer's Tor: SOCKS 9050…9090, control 9051…9091, TransPort 9040, DNSPort 9054+9055;
+    # hide-dns on 9053 (Tor itself there before it existed);
     # the fast-lane proxy on 9049 while it has sites.
-    for p in 9040 9053 9050 9051 9060 9061 9070 9071 9080 9081 9090 9091 $([ -z "$(conf_get FAST_SITES)" ] || echo 9049); do
+    for p in 9040 9053 9054 9055 9050 9051 9060 9061 9070 9071 9080 9081 9090 9091 $([ -z "$(conf_get FAST_SITES)" ] || echo 9049); do
         line=$(ss -Hlntup "sport = :$p" 2>/dev/null) || true
         [ -n "$line" ] || continue
         who=$(grep -o 'users:(("[^"]*' <<<"$line" | head -n1 | cut -d'"' -f2) || true
-        [ "$who" = tor ] || [ "$who" = hide-fast-proxy ] && continue # ours, or the distro's Tor: setup stops it
+        [ "$who" = tor ] || [ "$who" = hide-fast-proxy ] || [ "$who" = hide-dns ] && continue # ours, or the distro's Tor: setup stops it
         echo "port $p: taken by ${who:-another program}, and hide's Tor needs it. Stop or move that program (Fedora's Cockpit holds 9090: systemctl disable --now cockpit.socket)." >&2
         bad=1
     done
@@ -455,7 +458,7 @@ uninstall_all() {
     if [ -x "$HIDE" ]; then as_user "$HIDE" remove --all || true; fi
     if [ -x "$GLOBAL_PROXY" ]; then as_user "$GLOBAL_PROXY" off || true; fi
     as_user find "$USER_HOME/.config/hide" -depth -type d -empty -delete 2>/dev/null || true
-    systemctl disable --now ip-changer.service hide.service hide-fast.service >/dev/null 2>&1 || true
+    systemctl disable --now ip-changer.service hide-dns.service hide.service hide-fast.service >/dev/null 2>&1 || true
     if [ -x "$HIDE" ]; then "$HIDE" teardown; fi
     firewall close
     for f in "${FILES[@]}"; do
