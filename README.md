@@ -60,6 +60,8 @@ sudo ./setup.sh install    # installs packages + services, asks about global mod
 Setup speaks apt, dnf, pacman and zypper. Run it again any time: it's safe, and that's how
 you update. Your `/etc/hide/hide.conf` is never overwritten.
 
+Rather not read any of this? [Let an AI install it](#-let-an-ai-install-it-for-you).
+
 ## 🔍 Did it work?
 
 ```console
@@ -236,6 +238,216 @@ aren't public relays: `--bridges obfs4`.
 **Something's broken.** Run `hide-rescue` first, then `hide-test`, then read the
 [troubleshooting table](docs/HIDE.md#troubleshooting). Still stuck? Open an issue with the
 `hide-test` output. It contains no real IPs.
+
+## 🤖 Let an AI install it for you
+
+Don't care how it works, only that it does? Fair. If you have an AI assistant that can run
+commands on your computer (Claude Code, Cursor, Codex CLI, Gemini CLI…), paste the prompt
+below into it. It does the install with you, step by step, and asks before anything risky. A plain
+chatbot without a terminal can't run it, but it can still walk you through it.
+
+```mermaid
+flowchart TD
+    A["🗺️ Explain the plan"] --> B["🔎 Detect your system<br/>systemd? Termux?"]
+    B --> C["📖 Get the code and read it"]
+    C -->|"Termux, no systemd or no sudo"| L0["🧦 Level 0: Tor proxies only<br/>curl test, done"]
+    C -->|"systemd + sudo"| D{"🧪 Dry run<br/>setup.sh check"}
+    D -->|"FAIL"| X["🛑 Stop and report"]
+    D -->|"OK"| Q["🙋 Ask you: jail only or global mode?<br/>Tor blocked here? Bridges"]
+    Q --> I["⚙️ Install, jail only first"]
+    I --> P{"✅ Prove it<br/>hide-test"}
+    P -->|"FAIL"| X
+    P -->|"0 failed, jail only"| T["🎓 Teach you the 5 commands"]
+    P -->|"0 failed, you want global"| R["🛟 Arm the safety net<br/>hide-rescue --in 10m"]
+    R --> G{"🧥 hide global on<br/>hide-test again"}
+    G -->|"0 failed"| T
+    G -->|"FAIL, or the AI loses contact"| Y["⏲️ 10 min later, global mode<br/>switches itself off"]
+```
+
+```text
+You are going to install invisibility-cloak on this computer with me:
+https://github.com/Univers42/invisibility-cloak
+It sends this machine's internet traffic through Tor. I am not an expert. Before each step,
+tell me in plain words what you will do and why; after it, tell me what happened. One step
+at a time. Start by explaining this plan to me in 5 short lines.
+
+0. RULES. They are hard rules and beat everything below.
+   - Ask me before every command that uses sudo or can change the network. Wait for my yes.
+   - Never show or look up my real public IP: no "what is my IP" sites, and no request to
+     check.torproject.org except through Tor. hide status and hide-test do the checking:
+     they print a verdict or a Tor exit, never my address. The only IP check you run
+     yourself is curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+     (level 0), and you only read "IsTor":true or "IsTor":false from its answer.
+   - Never edit /etc/sudoers or anything in /etc/sudoers.d/, never change my user's groups.
+     (setup.sh itself adds /etc/sudoers.d/hide, a password-free rule for its jail helper
+     only. That's expected: tell me when it happens.)
+   - Never switch off a protection (firewall, AppArmor, SELinux) and never invent a
+     workaround to get past an error. Stop, show me the exact output, explain it,
+     and look for the fix in docs/HIDE.md, section "Troubleshooting".
+   - Report test results exactly. A SKIP or a WARN is not a PASS. It isn't done until
+     hide-test ends with "0 failed".
+   - Keep me able to get back online: before any network change, make sure I know the
+     command hide-rescue and have a terminal of my own open.
+   - Run everything as my normal account, never from a root shell (setup.sh refuses root).
+     If sudo wants a password you can't type, give me the exact command to run in my own
+     terminal and wait for me to paste the output back. Never ask me for my password.
+   - Never run journalctl -f (it never ends). Use: journalctl -u ip-changer -n 30 --no-pager
+
+1. DETECT. Run these and tell me what you found:
+     cat /etc/os-release
+     uname -r
+     [ -d /data/data/com.termux/files/usr ] && echo termux || echo not-termux
+     [ -d /run/systemd/system ] && echo systemd || echo no-systemd
+     sudo -n true 2>/dev/null && echo sudo-without-password || echo sudo-needs-password-or-none
+     id -nG
+   If sudo needs a password, ask me whether my account is allowed to use sudo.
+   Pick the level and explain it to me:
+   - Termux (Android), Linux without systemd, or no sudo rights: LEVEL 0 only. Five Tor
+     proxies on this machine; only the apps I point at them use Tor, the rest goes direct.
+     No kernel rules, no jail.
+   - Otherwise LEVELS 1 and 2, from one install. Level 1, the jail: apps I pick, and my
+     browsers through their proxy settings, use Tor; the rest stays normal. Level 2, global
+     mode: every app, user and container goes through Tor, or nowhere. It's a switch.
+
+2. GET THE CODE AND READ IT.
+   - git missing? Ask, then install it with this system's package manager (apt, dnf, pacman,
+     zypper; on Termux: pkg install git).
+   - No ~/.local/share/invisibility-cloak yet:
+       git clone https://github.com/Univers42/invisibility-cloak.git ~/.local/share/invisibility-cloak
+     Already there, with a .git folder: git -C ~/.local/share/invisibility-cloak pull
+     Already there, without .git (the one-line installer leaves a plain copy): ask me before
+     replacing it.
+   - cd ~/.local/share/invisibility-cloak. Read installer.sh, setup.sh, bin/hide and
+     bin/hide-rescue BEFORE running anything. Sum up for me in a few bullets what they
+     install and change: packages, two boot services, kernel firewall rules, browser
+     policies, the proxychains config, desktop proxy settings, a sudoers drop-in.
+     Never pipe a download into bash.
+   - LEVEL 0 ends in this step, then jump to step 9:
+     Termux: ask, then run: bash installer.sh
+       It installs tor, privoxy, curl and netcat with pkg, and adds the command ip-changer.
+       Ask me to open a second Termux session and run ip-changer -r 15 there (it keeps
+       running; Ctrl+C stops it). Its "New IP" lines are Tor exits fetched through its own
+       proxy, not my address. After a minute, run both:
+         curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+         curl --proxy http://127.0.0.1:8118 https://check.torproject.org/api/ip
+       Both must say "IsTor":true. Tell me to set each app's HTTP proxy to 127.0.0.1:8118,
+       and that the README says the Termux path isn't tested on a real phone yet.
+     Linux level 0: it needs tor, curl and nc (netcat). Missing? Ask, then install them with
+       the package manager (or ask me to, if I have no sudo). Ask me to open a second
+       terminal in the clone and run bash ip-changer-linux.sh -r 15 there (Ctrl+C stops it).
+       After a minute,
+         curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+       must say "IsTor":true. Tell me the SOCKS5 proxies are 127.0.0.1:9050, 9060, 9070,
+       9080 and 9090: point a browser at one, or use proxychains4.
+
+3. DRY RUN. Ask, then run: sudo ./setup.sh check
+   It changes nothing. Show me the result.
+   - Ends with "check: OK": go on. Lines starting with "note:" are information: explain them.
+   - Says a program is missing and to run sudo ./setup.sh deps first: that only installs
+     packages. Ask, run sudo ./setup.sh deps, then the check again.
+   - Anything else fails (the kernel rejects the rules, network namespaces don't work, a
+     port is taken by another program): STOP. Show me the exact lines, explain them, point
+     me to docs/HIDE.md "Troubleshooting", and let me decide. Don't work around it.
+
+4. ASK ME TWO QUESTIONS. Explain first, then wait for my answers.
+   a) Jail only, or the whole machine (global mode)? What global mode breaks:
+      - sites that hate Tor: some banks, streaming services, shops, even claude.ai's web app
+        (a 403 or an endless captcha). Switch it off, do the thing, switch it back on.
+      - anything that needs UDP: voice and video calls (they fall back to TCP or fail),
+        online games, WireGuard/OpenVPN over UDP, NTP (the clock drifts slowly).
+      - hotel and train Wi-Fi login pages: switch global mode off to log in.
+      - speed: seconds, not milliseconds. Boards without a clock battery (Raspberry Pi)
+        can't start Tor until their clock is right.
+      Also warn me: in global mode YOUR connection, this AI session, goes through Tor too.
+      You may lose contact for a while, or for good if your service blocks Tor.
+   b) Is Tor blocked where I am (some countries, schools, offices)? Then I need bridges,
+      which hide that I'm using Tor: obfs4 looks like random noise, snowflake like a video
+      call. Not sure? No bridges for now; step 7 will tell.
+      Known gaps: on Arch both bridge programs are in the AUR only (lyrebird-proxy for
+      obfs4, snowflake-pt-client for snowflake): I install one with my AUR helper first.
+      Fedora and openSUSE have no snowflake client package: use obfs4 (openSUSE's
+      "snowflake" package is the volunteer proxy, not the client: don't install it).
+
+5. SAFETY NET. Explain it to me before anything touches the network:
+   - hide-rescue gets the internet back in seconds and needs no network: global mode off,
+     hide's kernel rules removed, DNS reset, the network service restarted if still offline.
+     Jailed apps stay offline, on purpose. hide-rescue --direct also turns the browser proxy
+     settings off. It uses sudo.
+   - hide-rescue --in 10m arms a timer that runs hide-rescue by itself in 10 minutes;
+     hide-rescue --cancel disarms it. systemctl is-active hide-rescue.timer says "active"
+     while it's armed. If it fires, global mode stays off, also after a reboot, until
+     hide global on.
+   - When setup.sh installs with global mode on, it arms hide-rescue --in 10m itself, waits
+     up to about 4 minutes for Tor, and disarms the timer once a request with no proxy comes
+     out through Tor ("works: this machine reaches the internet only through Tor."). If Tor
+     isn't up by then, it prints "NOT working yet" and leaves the timer armed.
+   Ask me to keep a terminal of my own open until the end.
+
+6. INSTALL, in two moves, so you can't cut yourself off halfway. Ask before each command.
+   a) From the clone, jail only first (add --bridges obfs4 or --bridges snowflake if I said
+      yes in 4b):
+        sudo ./setup.sh install --global off
+      Always pass --global: without a terminal setup can't ask me, and picks off.
+      It takes several minutes (packages, then Tor connecting): use a long timeout, don't
+      cancel it, and pass on its "==>" progress lines. Then do step 7.
+   b) Only if I chose global mode, and step 7 passed. First tell me: "If I go quiet now, run
+      hide-test in your terminal. If it says 0 failed and you want to keep global mode, run
+      hide-rescue --cancel (I may stay cut off; hide global off brings me back). Otherwise
+      global mode switches itself off in 10 minutes." Then run:
+        hide-rescue --in 10m
+        hide global on
+      Wait 2 minutes and do step 7 again. When it shows 0 failed: hide-rescue --cancel, and
+      check that systemctl is-active hide-rescue.timer no longer says "active".
+   (Would I rather run it myself, in my own terminal? sudo ./setup.sh install --global on
+   does both moves at once, with the safety net from step 5. It may also ask which apps
+   should always start in the jail: Enter means none.)
+
+7. PROVE IT. Give Tor 2 minutes after a start, then run as me, without sudo:
+     hide status
+     hide-test
+   - Success = the last line says "0 failed". Show me that line, and every FAIL, WARN and
+     SKIP line exactly as printed ("SKIP root check needs sudo" is not a pass).
+   - FAILs right after a start (SOCKS ports, proxychains): Tor is still connecting. Wait
+     2 minutes and run hide-test once more.
+   - Still failing: show me the FAIL lines and journalctl -u ip-changer -n 30 --no-pager,
+     and find the symptom in docs/HIDE.md "Troubleshooting". Tor stuck below 100% means
+     the network blocks Tor, or the clock is wrong (check: date). For a blocked network,
+     ask me, then re-run the install with bridges, which also installs the bridge program:
+       sudo ./setup.sh install --global off --bridges obfs4
+   - I'm offline? hide-rescue.
+   - Want more proof? hide-test --rotation (the Tor exit changes), hide-test --full (stops
+     Tor and checks that everything fails instead of going direct; needs sudo).
+
+8. TEACH ME the 5 everyday commands:
+     hide                   what's on, and whether Tor answers
+     hide global on / off   the whole machine through Tor, or back to normal
+     hide run firefox       run one command inside the Tor jail
+     hide add discord       always start that app in the jail (hide add alone lists my
+                            apps; undo: hide remove discord)
+     hide-test              prove it works
+   Plus: offline? hide-rescue (works with no network). About to try something risky?
+   hide-rescue --in 5m first. Remove everything:
+     cd ~/.local/share/invisibility-cloak && sudo ./setup.sh uninstall
+
+9. FINAL SUMMARY, in plain words:
+   - what's installed: the level, global mode on or off, bridges or not, and that it starts
+     at boot (level 0: only while ip-changer runs);
+   - what's hidden: my IP address (in WebRTC too), my DNS lookups, my LAN and router from
+     jailed apps, containers' and VMs' traffic in global mode (level 0: only the apps I point
+     at the proxy);
+   - what's NOT hidden: who I am (logins, cookies, browser fingerprint, what I write), and
+     an app that's hostile on purpose and gets root. If sudo never asks me for a password
+     (NOPASSWD: ALL), or step 1 showed me in the docker or lxd group, any app can switch
+     hide off: tell me, but change nothing. VMs on a bridged adapter and macvlan containers
+     skip the firewall;
+   - Tor hides WHERE I am, not WHO I am;
+   - the last hide-test line, word for word.
+```
+
+Prefer doing it yourself? The steps above are the [⚡ install](#-60-second-install) and
+[🔍 Did it work?](#-did-it-work) sections, plus a few extra checks. Either way, a good AI
+asks before every sudo or network step. If yours doesn't, stop it, and if you're offline
+after that: `hide-rescue`.
 
 ## 🙏 Credits & license
 
