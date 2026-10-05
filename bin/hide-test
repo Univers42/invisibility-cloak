@@ -113,7 +113,10 @@ def dns_query(name):
     labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
     return os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + b"\x00\x00\x01\x00\x01"
 def dns_ok(q, r):
-    return "answer" if r[:2] == q[:2] and int.from_bytes(r[6:8], "big") > 0 else "empty"
+    if r[:2] == q[:2] and int.from_bytes(r[6:8], "big") > 0:
+        return "answer"
+    rcode = r[3] & 15 if len(r) > 3 else -1  # Tor says SERVFAIL when it can not resolve through its circuit
+    return "empty (%s)" % {0: "no records", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}.get(rcode, "rcode %d" % rcode)
 
 cmd = sys.argv[1]
 if cmd == "stun":
@@ -128,14 +131,14 @@ if cmd == "stun":
     print(udp("127.0.0.1", srv.getsockname()[1], req, want=stun_ok),
           udp("stun.l.google.com", 19302, STUN + os.urandom(12), want=stun_ok))
 elif cmd == "dns":
-    # Tor resolves through a circuit, which sometimes fails once: no answer (or an empty one)
-    # gets one more try, 5 s later.
+    # Tor resolves through a circuit, which sometimes fails for a few seconds: no answer (or an
+    # empty one) gets two more tries, 10 s apart.
     dev = sys.argv[3] if len(sys.argv) > 3 else None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         r = udp(sys.argv[2], 53, dns_query("example.com"), timeout=10, want=dns_ok, dev=dev)
-        if attempt == 2 or r not in ("empty", "blocked"):
+        if attempt == 3 or not (r == "blocked" or r.startswith("empty")):
             break
-        time.sleep(5)
+        time.sleep(10)
     print(r)
 elif cmd == "upnp":
     ssdp = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n"
