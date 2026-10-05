@@ -101,6 +101,22 @@ if ! command -v tor &> /dev/null; then
     exit 1
 fi
 
+# pt_bin TRANSPORT PROGRAM…: the first installed program that runs TRANSPORT, asked the way Tor
+# asks (lyrebird also runs webtunnel and snowflake; obfs4proxy runs obfs4 only).
+pt_bin() {
+    local t=$1 p d r
+    shift
+    for p; do
+        p=$(command -v "$p") || continue
+        d=$(mktemp -d) || return 1
+        r=$(TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_CLIENT_TRANSPORTS=$t TOR_PT_STATE_LOCATION=$d \
+            TOR_PT_EXIT_ON_STDIN_CLOSE=1 timeout 5 "$p" </dev/null 2>/dev/null)
+        rm -rf "$d"
+        if [[ $r == *"CMETHOD $t "* ]]; then echo "$p" && return 0; fi
+    done
+    return 1
+}
+
 # BRIDGES=snowflake|obfs4 (Tor Browser's lines, in bridges/ next to this script) or the path to
 # a file of your own lines from https://bridges.torproject.org: reach Tor where it's blocked.
 bridge_conf() {
@@ -117,8 +133,9 @@ bridge_conf() {
     echo "UseBridges 1"
     while read -r pt; do
         case $pt in
-            obfs4 | webtunnel) need="lyrebird (or obfs4proxy)" bin=$(command -v lyrebird || command -v obfs4proxy) ;;
-            snowflake) need=snowflake-client bin=$(command -v snowflake-client || command -v snowflake-pt-client) ;;
+            obfs4) need="lyrebird (or obfs4proxy)" bin=$(pt_bin obfs4 lyrebird obfs4proxy) ;;
+            webtunnel) need=lyrebird bin=$(pt_bin webtunnel lyrebird) ;;
+            snowflake) need="snowflake-client (or lyrebird)" bin=$(pt_bin snowflake snowflake-client snowflake-pt-client lyrebird) ;;
             *) need="a program for '$pt'" bin="" ;;
         esac
         if [[ -z "$bin" ]]; then
