@@ -59,7 +59,8 @@ uninstall turns it back on only if it was on before.
   exempt the `ipchanger` uid. Without that Tor would be sent into itself.
 - **Bridges** (`BRIDGES=`): `snowflake` and `obfs4` use the bridge lines built into Tor
   Browser (`bridges/*.txt`, with their source and date). They need `snowflake-client`, or
-  `lyrebird`/`obfs4proxy`; `setup.sh install --bridges …` installs it. These shared lines go
+  `lyrebird`/`obfs4proxy`; `setup.sh install --bridges …` installs it. Arch has them in the
+  AUR only (`lyrebird-proxy`, `snowflake-pt-client`): setup names the package. These shared lines go
   stale over time: fresh private ones come from https://bridges.torproject.org
   (`hide bridges ./my-bridges.txt`).
 - Tor's control ports (9051, 9061 … 9091) have no password, so **in both modes** only the
@@ -230,6 +231,11 @@ no check failed; warnings and skips are listed but don't fail it.
 - **Something flushing every firewall rule.** `nft flush ruleset` by hand, or a tool doing
   the same, removes hide's rules until `sudo systemctl restart hide`; the jail stays
   closed meanwhile (its routing guard), and in global mode `hide status` says so.
+  Restarting or reloading `nftables.service`, and booting with it enabled, are fine:
+  `hide.service` puts its rules back right after (tested on Debian, Fedora, Ubuntu and Arch).
+- **Tor inside a VM or container on a global-mode host** is Tor over Tor. Exit relays
+  refuse connections to other relays, so the inner Tor stays stuck at 10%. Give it
+  bridges, which aren't public relays (`--bridges obfs4`).
 - **Who you are, as opposed to where you are.** Logins, cookies, browser fingerprinting
   and the content you post identify you whatever your IP. Use separate profiles or
   containers for identities you want kept apart.
@@ -249,6 +255,7 @@ no check failed; warnings and skips are listed but don't fail it.
 | Symptom | Fix |
 |---|---|
 | Nothing loads | Tor isn't up yet (bootstrapping takes 10–60 s), or is blocked: `journalctl -fu ip-changer`. Need the internet now? `hide-rescue` (works offline; add `--direct` if browsers still don't load) |
+| `hide-test` FAILs right after install or boot (SOCKS ports, proxychains) | Tor is still connecting: wait 2 minutes and re-run. `hide-test` warns when the engine has just started |
 | Tor never connects: the log stays stuck below 100% | your network blocks Tor: `hide bridges obfs4` (or `snowflake`). Also check the clock: `date` |
 | `setup.sh check`: a port is held by another program | stop it (Fedora's Cockpit holds 9090: `sudo systemctl disable --now cockpit.socket`), or remove the Tor you run on those ports, then install again |
 | `setup.sh check`: the kernel rejects the rules | hide needs Linux ≥ 5.2 and nftables ≥ 0.9.3 |
