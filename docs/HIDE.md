@@ -60,9 +60,10 @@ uninstall turns it back on only if it was on before.
 - **Bridges** (`BRIDGES=`): `snowflake` and `obfs4` use the bridge lines built into Tor
   Browser (`bridges/*.txt`, with their source and date). They need `snowflake-client`, or
   `lyrebird`/`obfs4proxy`; `setup.sh install --bridges …` installs it. Arch has them in the
-  AUR only (`lyrebird-proxy`, `snowflake-pt-client`): setup names the package. These shared lines go
-  stale over time: fresh private ones come from https://bridges.torproject.org
-  (`hide bridges ./my-bridges.txt`).
+  AUR only (`lyrebird-proxy`, `snowflake-pt-client`): setup names the package. Fedora and
+  openSUSE have no snowflake client package (obfs4 is fine; openSUSE's `snowflake` is the
+  volunteer proxy, which setup won't install). These shared lines go stale over time: fresh
+  private ones come from https://bridges.torproject.org (`hide bridges ./my-bridges.txt`).
 - Tor's control ports (9051, 9061 … 9091) have no password, so **in both modes** only the
   `ipchanger` user may connect to them. Otherwise any app could tell Tor to use a bridge
   of its choice and learn your IP.
