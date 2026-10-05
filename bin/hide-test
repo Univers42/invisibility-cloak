@@ -80,10 +80,14 @@ PROBE='
 import os, socket, sys, threading, time
 
 def udp(host, port, payload, timeout=4, want=None, dev=None):
-    try:
-        addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
-    except OSError:
-        return "nodns"
+    for attempt in (1, 2):  # names resolve through Tor, which sometimes fails once
+        try:
+            addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+            break
+        except OSError:
+            if attempt == 2:
+                return "nodns"
+            time.sleep(5)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
@@ -200,7 +204,8 @@ for u in hide ip-changer; do
 done
 # Tor opens its ports before it has connected: just after a start, a FAIL below can mean "not yet".
 t=$(systemctl show --value -p ActiveEnterTimestampMonotonic ip-changer 2>/dev/null)
-age=$(($(cut -d. -f1 /proc/uptime) - ${t:-0} / 1000000))
+# Compared on systemd's own clock: /proc/uptime counts suspend, and LXD fakes it per container.
+age=$(($(python3 -c 'import time; print(int(time.monotonic()))') - ${t:-0} / 1000000))
 if [[ $t =~ ^[1-9][0-9]*$ ]] && ((age < 180)); then meh "ip-changer started ${age}s ago: Tor may still be connecting, and a FAIL below can just mean \"not yet\". Re-run in 2 minutes"; fi
 if [ -z "$uid" ]; then
     bad "no '$ENGINE' user (setup.sh install not run?)"
