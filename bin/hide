@@ -5,6 +5,8 @@
 #   hide run <cmd> [args…]       run one command inside the Tor jail
 #   hide add [<app>]             make an app's launcher always start in the jail (no arg: list)
 #   hide remove <app>|--all      undo `hide add`
+#   hide fast [add|remove youtube|twitch|<domain>|<app>]   the fast lane: skips Tor (speed, UDP)
+#   hide fast run <cmd> [args…]  one command in the fast lane     hide fast off   close it
 #   hide bridges snowflake|obfs4|FILE|off   reach Tor on a network that blocks it (asks for sudo)
 #   hide check-rules             can this kernel run hide? tests every rule, loads nothing (sudo)
 #   hide apply|teardown          root, used by hide.service: build / remove the kernel rules
@@ -14,6 +16,9 @@ set -euo pipefail
 CONF=/etc/hide/hide.conf
 SELF=/usr/local/bin/hide
 HELPER=/usr/local/libexec/hide-jail
+PROXY=/usr/local/libexec/hide-fast-proxy
+GLOBAL_PROXY=/usr/local/bin/global-proxy
+FAST=hide-fast FAST_PORT=9049
 ENGINE=ipchanger
 NS=hide HOST_IF=hide0 JAIL_IF=hide1 HOST_IP=10.233.233.1 JAIL_IP=10.233.233.2
 TRANS=9040 DNS=9053 RT_TABLE=233
@@ -37,12 +42,20 @@ conf_set() { if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=$2|" "$CONF"; e
 # Anything but an explicit "off" means on: a typo must not open the machine up.
 global_mode() { if [ "$(conf_get GLOBAL)" = off ]; then echo off; else echo on; fi; }
 
+# The hide-fast gid while the fast lane is in use (sites or apps), else nothing.
+fast_gid() {
+    if [ -n "$(conf_get FAST_SITES)" ] || [ "$(conf_get FAST_APPS)" = on ]; then getent group "$FAST" | cut -d: -f3 || true; fi
+}
+
 # ---- kernel rules (root) ---------------------------------------------------
 
-# One nftables table, replaced atomically. Lines starting with @G only exist in global mode.
+# One nftables table, replaced atomically. Lines starting with @G only exist in global mode,
+# @F ones only in global mode with the fast lane in use (its gid as 3rd argument).
 ruleset() {
-    local uid=$1 mode=$2
-    cat <<EOF | if [ "$mode" = on ]; then sed 's/^@G/  /'; else sed '/^@G/d'; fi
+    local uid=$1 mode=$2 fast=${3:-} keep='/^@[GF]/d'
+    if [ "$mode" = on ]; then keep='s/^@G/  /; /^@F/d'; fi
+    if [ "$mode" = on ] && [ -n "$fast" ]; then keep='s/^@[GF]/  /'; fi
+    cat <<EOF | sed "$keep"
 table inet hide
 delete table inet hide
 table inet hide {
@@ -67,6 +80,8 @@ table inet hide {
         type nat hook output priority dstnat - 1; policy accept;
 @G      meta skuid $uid return
 @G      ip daddr != 127.0.0.0/8 udp dport 53 dnat ip to ip saddr : $DNS
+@F      # The fast lane (hide fast): its proxy and apps go out directly; their DNS stays on Tor.
+@F      meta skgid $fast return
 @G      ip daddr != @local4 meta l4proto tcp dnat ip to ip saddr : $TRANS
     }
 
@@ -81,6 +96,7 @@ table inet hide {
 @G      # UPnP / NAT-PMP would let any app ask the router for your public IP.
 @G      udp dport { 1900, 5351 } drop
 @G      meta l4proto { tcp, udp } th dport 53 drop
+@F      meta skgid $fast accept
 @G      # Whatever Tor can't carry (UDP, ICMP, IPv6) never leaves: apps get EPERM.
 @G      ip daddr != @local4 drop
 @G      ip6 daddr != @local6 drop
@@ -147,6 +163,8 @@ table ip hidejail {
         type nat hook output priority dstnat; policy accept;
         ip daddr 127.0.0.0/8 udp dport 53 dnat to $HOST_IP:$DNS
         ip daddr 127.0.0.0/8 tcp dport { $SOCKS_PORTS } dnat to $HOST_IP
+        # Never the fast lane from the jail: its port leads to Tor's SOCKS port instead.
+        ip daddr 127.0.0.0/8 tcp dport $FAST_PORT dnat to $HOST_IP:9050
     }
     chain post {
         type nat hook postrouting priority srcnat; policy accept;
@@ -160,7 +178,7 @@ apply() {
     [ "$(id -u)" -eq 0 ] || die "apply needs root (hide.service runs it)"
     local uid
     uid=$(id -u "$ENGINE") || die "no '$ENGINE' user: run setup.sh install"
-    ruleset "$uid" "$(global_mode)" | nft -f -
+    ruleset "$uid" "$(global_mode)" "$(fast_gid)" | nft -f -
     jail_up
 }
 
@@ -169,7 +187,7 @@ check_rules() {
     [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" check-rules
     local uid
     uid=$(id -u "$ENGINE" 2>/dev/null) || uid=0
-    ruleset "$uid" on | nft -c -f - || die "this kernel or nft version rejects the global rules (needs Linux >= 5.2, nftables >= 0.9.3)"
+    ruleset "$uid" on 65534 | nft -c -f - || die "this kernel or nft version rejects the global rules (needs Linux >= 5.2, nftables >= 0.9.3)"
     jail_rules | nft -c -f - || die "this kernel or nft version rejects the jail rules"
     echo "rules: this kernel accepts all of them (global mode and jail)."
 }
@@ -229,34 +247,50 @@ bridges() {
 # A single-instance app (browser, Electron) already running outside the jail would
 # just open a window in that instance and keep your real IP. Launchers refuse; a
 # terminal `hide run` only warns, since `hide run python3 …` is fine next to other pythons.
+# The fast lane: same check, by the process's group instead of its network.
 check_outside() {
-    local strict=$1 a name="" n pid jail
-    shift
+    local strict=$1 lane=$2 a name="" n pid want got where="the Tor jail"
+    shift 2
     for a in "$@"; do
         case "$a" in env | /usr/bin/env | [A-Za-z_]*=*) continue ;; esac
         name=$(basename "$a")
         break
     done
     [ -n "$name" ] || return 0
-    jail=$(stat -L -c %i "/run/netns/$NS" 2>/dev/null) || return 0 # jail down: hide-jail refuses anyway
+    if [ "$lane" = fast ]; then
+        want=$(getent group "$FAST" | cut -d: -f3) || return 0
+        where="the fast lane"
+    else
+        want=$(stat -L -c %i "/run/netns/$NS" 2>/dev/null) || return 0 # jail down: hide-jail refuses anyway
+    fi
     # ponytail: name match (comm is 15 chars), plus google-chrome-stable -> chrome and the like.
     for n in "$name" "$(sed -E 's/^google-//; s/-(stable|beta|browser|bin)$//' <<<"$name")"; do
         for pid in $(pgrep -u "$(id -u)" -i -x -- "${n:0:15}" || true); do
-            [ "$(stat -L -c %i "/proc/$pid/ns/net" 2>/dev/null)" != "$jail" ] || continue
+            if [ "$lane" = fast ]; then got=$(stat -c %g "/proc/$pid" 2>/dev/null); else got=$(stat -L -c %i "/proc/$pid/ns/net" 2>/dev/null); fi
+            [ "$got" != "$want" ] || continue
             if [ "$strict" = 1 ]; then
-                die "$n is already running outside the Tor jail (pid $pid): quit it completely, then start it again."
+                die "$n is already running outside $where (pid $pid): quit it completely, then start it again."
             fi
-            echo "hide: warning: $n also runs outside the jail (pid $pid); a single-instance app would hand this launch to it." >&2
+            echo "hide: warning: $n also runs outside $where (pid $pid); a single-instance app would hand this launch to it." >&2
             return 0
         done
     done
 }
 
-run() {
-    local strict=0
+run_in() { # jail|fast [--app] <command> [args…]
+    local lane=$1 strict=0 flag=() verb=run
+    shift
     if [ "${1:-}" = --app ]; then strict=1 && shift; fi
-    [ $# -gt 0 ] || die "usage: hide run <command> [args…]"
-    check_outside "$strict" "$@"
+    if [ "$lane" = fast ]; then verb="fast run"; fi
+    [ $# -gt 0 ] || die "usage: hide $verb <command> [args…]"
+    if [ "$lane" = fast ]; then
+        flag=(--fast)
+        if [ "$(conf_get FAST_APPS)" != on ]; then
+            echo "hide: opening the fast lane for apps (close it: hide fast off)" >&2
+            sudo "$(readlink -f "$0")" __fast "$(conf_get FAST_SITES)" on
+        fi
+    fi
+    check_outside "$strict" "$lane" "$@"
     local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hide"
     # No login session (su, cron, a container) means no runtime dir: mktemp's file is private anywhere.
     if ! { mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir"; }; then dir=${TMPDIR:-/tmp}; fi
@@ -264,7 +298,7 @@ run() {
     trap 'rm -f "$RUN_FILE"' EXIT
     # Your environment travels in a private file, not on sudo's command line (which is logged).
     { env -0; printf '\0'; printf '%s\0' "$@"; } >"$RUN_FILE"
-    sudo -n "$HELPER" "$RUN_FILE"
+    sudo -n "$HELPER" "${flag[@]}" "$RUN_FILE"
 }
 
 # Runs as you, already inside the jail (hide-jail put it there): rebuild env + argv, exec.
@@ -294,7 +328,7 @@ launchers() {
     while read -r d; do
         for f in "$d"/*.desktop; do
             [ -f "$f" ] || continue
-            if grep -q '^X-Hide=true' "$f"; then continue; fi
+            if ours "$f"; then continue; fi
             id=$(basename "$f" .desktop)
             [ -z "${seen[$id]:-}" ] || continue
             seen[$id]=1
@@ -305,11 +339,15 @@ launchers() {
 
 desktop_name() { sed -n '/^Name=/{s///p;q}' "$1"; }
 
+# Launchers we wrote: X-Hide=true (Tor jail) or X-Hide=fast (fast lane).
+ours() { grep -qsE '^X-Hide=(true|fast)' "$1"; }
+
 # Does launcher <id>/<name> answer to what the user typed? id, snap id (x_x), the last
 # part of a flatpak id (com.discordapp.Discord), or the visible name; any case.
 matches() {
     local id=${1,,} name=${2,,} want=${3,,}
     name=${name% (tor)}
+    name=${name% (fast)}
     [ "$id" = "$want" ] || [ "$id" = "${want}_$want" ] || [ "${id##*.}" = "$want" ] || [ "$name" = "$want" ]
 }
 
@@ -321,20 +359,22 @@ list_apps() {
     done < <(launchers) | sort
 }
 
-# A copy of a launcher whose every Exec= starts inside the Tor jail.
-jailed() {
-    awk -v run="$SELF run --app " '
-        /^\[/ { sec = $0; print; if (sec == "[Desktop Entry]") print "X-Hide=true"; next }
+# A copy of a launcher whose every Exec= starts inside the Tor jail (or the fast lane).
+jailed() { # <file> [jail|fast]
+    local run="$SELF run --app " mark=true tag=" (Tor)"
+    if [ "${2:-jail}" = fast ]; then run="$SELF fast run --app " mark=fast tag=" (fast)"; fi
+    awk -v run="$run" -v mark="$mark" -v tag="$tag" '
+        /^\[/ { sec = $0; print; if (sec == "[Desktop Entry]") print "X-Hide=" mark; next }
         sec == "[Desktop Entry]" && /^(DBusActivatable|TryExec)=/ { next }
         /^Exec=/ { sub(/^Exec=/, "Exec=" run) }
-        sec == "[Desktop Entry]" && /^Name(\[[^]]*\])?=/ { $0 = $0 " (Tor)" }
+        sec == "[Desktop Entry]" && /^Name(\[[^]]*\])?=/ { $0 = $0 tag }
         { print }' "$1"
 }
 
 # Keep the user's own file (never one we wrote) so `remove` can put it back.
 backup() { # <file> <applications|autostart>
     [ -f "$1" ] || return 0
-    if grep -q '^X-Hide=true' "$1"; then return 0; fi
+    if ours "$1"; then return 0; fi
     mkdir -p "$STATE/backup/$2"
     cp -p "$1" "$STATE/backup/$2/"
 }
@@ -345,48 +385,61 @@ restore() { # <id> <applications|autostart>
     if [ -f "$b" ]; then mv "$b" "$dst/"; fi
 }
 
-add() {
+# "<id>\t<file>" of the launcher that answers to <app>, or fail.
+find_app() {
+    local id f
+    while IFS=$'\t' read -r id f; do
+        if matches "$id" "$(desktop_name "$f")" "$1"; then printf '%s\t%s\n' "$id" "$f" && return 0; fi
+    done < <(launchers)
+    return 1
+}
+
+add() { # [<app> [jail|fast]]
     [ $# -gt 0 ] || {
         list_apps
         return
     }
-    local id="" f name src
-    while IFS=$'\t' read -r id f; do
-        if matches "$id" "$(desktop_name "$f")" "$1"; then src=$f && break; fi
-        id=""
-    done < <(launchers)
-    [ -n "$id" ] || die "no launcher matches '$1' — 'hide add' lists them"
+    local lane=${2:-jail} id src f name where="the Tor jail"
+    [ "$lane" = jail ] || where="the fast lane"
+    IFS=$'\t' read -r id src < <(find_app "$1") || die "no launcher matches '$1' — 'hide add' lists them"
+    # Moving an app between lanes: start again from your own launcher, not from our copy.
+    if [ -f "$STATE/backup/applications/$id.desktop" ]; then src=$STATE/backup/applications/$id.desktop; fi
     mkdir -p "$APPDIR"
     backup "$APPDIR/$id.desktop" applications
-    jailed "$src" >"$APPDIR/$id.desktop.tmp"
+    jailed "$src" "$lane" >"$APPDIR/$id.desktop.tmp"
     mv "$APPDIR/$id.desktop.tmp" "$APPDIR/$id.desktop"
-    if [ -f "$AUTOSTART/$id.desktop" ] && ! grep -q '^X-Hide=true' "$AUTOSTART/$id.desktop"; then
+    if [ -f "$AUTOSTART/$id.desktop" ]; then
         backup "$AUTOSTART/$id.desktop" autostart
-        jailed "$STATE/backup/autostart/$id.desktop" >"$AUTOSTART/$id.desktop"
+        if [ -f "$STATE/backup/autostart/$id.desktop" ]; then jailed "$STATE/backup/autostart/$id.desktop" "$lane" >"$AUTOSTART/$id.desktop"; fi
     fi
     for f in "$AUTOSTART"/*.desktop; do
         [ "$f" != "$AUTOSTART/$id.desktop" ] || continue
-        if grep -qsi -- "$1" "$f"; then echo "hide: warning: $f may also start $1 outside the jail at login." >&2; fi
+        if grep -qsi -- "$1" "$f"; then echo "hide: warning: $f may also start $1 outside $where at login." >&2; fi
     done
     name=$(desktop_name "$src")
-    echo "$name ($id) now starts in the Tor jail. If it is open, quit it fully first. Undo: hide remove $1"
+    if [ "$lane" = fast ]; then
+        echo "$name ($id) now starts in the fast lane: direct, NOT through Tor (calls and games work). If it is open, quit it fully first. Undo: hide fast remove $1"
+    else
+        echo "$name ($id) now starts in the Tor jail. If it is open, quit it fully first. Undo: hide remove $1"
+    fi
 }
 
-remove() {
+remove() { # <app>|--all [fast]
     [ $# -gt 0 ] || die "usage: hide remove <app>|--all"
-    local f id found=0
+    local f id found=0 mark='(true|fast)'
+    if [ "${2:-}" = fast ]; then mark=fast; fi
     for f in "$APPDIR"/*.desktop; do
-        grep -qs '^X-Hide=true' "$f" || continue
+        grep -qsE "^X-Hide=$mark" "$f" || continue
         id=$(basename "$f" .desktop)
         [ "$1" = --all ] || matches "$id" "$(desktop_name "$f")" "$1" || continue
         rm -f "$f"
         restore "$id" applications
-        if grep -qs '^X-Hide=true' "$AUTOSTART/$id.desktop"; then rm -f "$AUTOSTART/$id.desktop"; fi
+        if ours "$AUTOSTART/$id.desktop"; then rm -f "$AUTOSTART/$id.desktop"; fi
         restore "$id" autostart
         echo "$id: starts normally again."
         found=1
     done
-    [ "$found" = 1 ] || [ "$1" = --all ] || die "no jailed launcher matches '$1'"
+    [ "$found" = 1 ] || [ "$1" = --all ] || die "no ${2:-jailed} launcher matches '$1'"
 }
 
 status() {
@@ -408,14 +461,123 @@ status() {
         sed -n 's/.*"IsTor":true,"IP":"\([^"]*\)".*/\1/p') || true
     if [ -n "$ip" ]; then echo "tor    : Tor exit $ip"; else echo "tor    : not answering on 127.0.0.1:9050"; fi
     for f in "$APPDIR"/*.desktop; do
-        if grep -qs '^X-Hide=true' "$f"; then echo "jailed : $(basename "$f" .desktop)"; fi
+        case "$(sed -n 's/^X-Hide=//p' "$f" 2>/dev/null)" in
+            true) echo "jailed : $(basename "$f" .desktop)" ;;
+            fast) echo "fast   : $(basename "$f" .desktop) (direct, not Tor)" ;;
+        esac
     done
+    f=$(conf_get FAST_SITES)
+    if [ -n "$f" ]; then echo "fast   : $f (direct, not Tor; proxy: hide-fast.service $(systemctl is-active hide-fast 2>/dev/null))"; fi
+}
+
+# ---- the fast lane (hide fast) ------------------------------------------------
+
+is_keyword() { [[ " $("$PROXY" --keywords 2>/dev/null) " == *" $1 "* ]]; }
+is_domain() { [[ $1 =~ ^[a-z0-9-]+(\.[a-z0-9-]+)+$ ]]; }
+
+# Root part: hide.conf, the kernel rules (the lane's exemption), the proxy service.
+fast_root() { # <sites> on|off
+    [ "$(id -u)" -eq 0 ] || die "__fast needs root"
+    getent passwd "$FAST" >/dev/null || die "no '$FAST' user: run setup.sh install again"
+    local w words
+    read -ra words <<<"${1:-}"
+    for w in "${words[@]}"; do is_keyword "$w" || is_domain "$w" || die "not youtube, twitch or a domain: '$w'"; done
+    case "${2:-}" in on | off) ;; *) die "usage: hide __fast <sites> on|off" ;; esac
+    conf_set FAST_SITES "\"${words[*]}\""
+    conf_set FAST_APPS "$2"
+    systemctl reload-or-restart hide.service
+    if [ ${#words[@]} -gt 0 ]; then
+        systemctl enable --quiet hide-fast.service
+        systemctl restart hide-fast.service
+    else
+        systemctl disable --quiet --now hide-fast.service 2>/dev/null || true
+    fi
+}
+
+fast_status() {
+    local s f apps=""
+    s=$(conf_get FAST_SITES)
+    for f in "$APPDIR"/*.desktop; do
+        if grep -qs '^X-Hide=fast' "$f"; then apps="$apps $(basename "$f" .desktop)"; fi
+    done
+    echo "The fast lane skips Tor: what's in it reaches the internet directly, with your real IP."
+    if [ -n "$s" ]; then
+        echo "sites: $s (browsers through 127.0.0.1:$FAST_PORT, hide-fast.service $(systemctl is-active hide-fast 2>/dev/null))"
+    else
+        echo "sites: none"
+    fi
+    if [ "$(conf_get FAST_APPS)" = on ]; then
+        echo "apps : on, launchers:${apps:- none}. Any command: hide fast run <cmd>"
+    else
+        echo "apps : off"
+    fi
+    echo "Change: hide fast add|remove youtube|twitch|<domain>|<app>    Close it all: hide fast off"
+}
+
+fast() {
+    local cmd=${1:-} w=${2:-} kind="" sites apps old s list
+    case "$cmd" in
+        "")
+            fast_status
+            return
+            ;;
+        run)
+            shift
+            run_in fast "$@"
+            return
+            ;;
+        off | add | remove) ;;
+        *) die "usage: hide fast [add|remove youtube|twitch|<domain>|<app>] | run <cmd> | off" ;;
+    esac
+    sites=$(conf_get FAST_SITES)
+    apps=$(conf_get FAST_APPS)
+    [ "$apps" = on ] || apps=off
+    old="$sites/$apps"
+    if [ "$cmd" != off ]; then
+        [ -n "$w" ] || die "usage: hide fast $cmd youtube|twitch|<domain>|<app>"
+        # A keyword, then an app, then a domain: "discord" is the app, "discord.com" the site.
+        if [ "$cmd" = remove ]; then
+            if [[ " $sites " == *" ${w,,} "* ]]; then kind=site; else kind=app; fi
+        elif is_keyword "${w,,}"; then
+            kind=site
+        elif find_app "$w" >/dev/null; then
+            kind=app
+        elif is_domain "${w,,}"; then
+            kind=site
+        else
+            die "'$w' is not youtube, twitch, an app (hide add lists them) or a domain"
+        fi
+    fi
+    case "$cmd:$kind" in
+        off:) sites="" apps=off ;;
+        add:site) [[ " $sites " == *" ${w,,} "* ]] || sites="${sites:+$sites }${w,,}" ;;
+        add:app) apps=on ;;
+        remove:site)
+            read -ra list <<<"$sites"
+            sites=""
+            for s in "${list[@]}"; do [ "$s" = "${w,,}" ] || sites="${sites:+$sites }$s"; done
+            ;;
+    esac
+    if [ "$sites/$apps" != "$old" ]; then sudo "$(readlink -f "$0")" __fast "$sites" "$apps"; fi
+    case "$cmd:$kind" in
+        off:) remove --all fast ;;
+        add:app) add "$w" fast ;;
+        remove:app)
+            remove "$w" fast
+            echo "hide fast run still works for any command; to close the lane for apps too: hide fast off"
+            ;;
+        add:site) echo "${w,,}: direct from now on (fast, NOT through Tor) in browsers set up by global-proxy." ;;
+        remove:site) echo "${w,,}: through Tor again." ;;
+    esac
+    # Browsers point at the fast-lane proxy only while it has sites: let global-proxy follow.
+    if [ "$kind" != app ] && [ -f "$STATE/proxy-before" ] && [ -x "$GLOBAL_PROXY" ]; then "$GLOBAL_PROXY" on >/dev/null || echo "hide: global-proxy on failed: run it yourself" >&2; fi
 }
 
 case "${1:-status}" in
 status) status ;;
 global) global "${2:-}" ;;
-run) shift && run "$@" ;;
+run) shift && run_in jail "$@" ;;
+fast) shift && fast "$@" ;;
 add) shift && add "$@" ;;
 remove) shift && remove "$@" ;;
 bridges) bridges "${2:-}" ;;
@@ -423,8 +585,9 @@ check-rules) check_rules ;;
 apply) apply ;;
 teardown) teardown ;;
 __enter) enter "$2" ;;
+__fast) fast_root "${2:-}" "${3:-}" ;;
 *)
-    sed -n '2,11s/^# \{0,1\}//p' "$0" >&2
+    sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
     exit 2
     ;;
 esac
