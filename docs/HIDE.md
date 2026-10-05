@@ -23,6 +23,8 @@ never overwritten by a re-install):
 | `ROTATE=30` | seconds between new Tor exits |
 | `APPS="…"` | launchers that always start inside the Tor jail |
 | `BRIDGES=…` | `snowflake`, `obfs4`, or a file of your own bridge lines: reach Tor where it is blocked. Empty = direct |
+| `FAST_SITES="…"` | the fast lane's sites: `youtube`, `twitch` or domains. They skip Tor in browsers set up by `global-proxy`. Set it with `hide fast` |
+| `FAST_APPS=off` | `on`: apps started with `hide fast run` skip Tor, UDP included. Off until you add an app |
 
 ## Commands
 
@@ -35,6 +37,11 @@ never overwritten by a re-install):
 | `hide add` | list the apps installed on this machine |
 | `hide add <app>` | that app's menu entry and autostart always start it inside the jail |
 | `hide remove <app>\|--all` | undo `hide add` |
+| `hide fast` | the fast lane: what's in it, and whether its proxy runs |
+| `hide fast add youtube\|twitch\|<domain>\|<app>` | a site (`youtube`, `twitch`, a domain) or an app skips Tor from now on. An app's launcher starts it in the fast lane, as `hide add` does for the jail |
+| `hide fast remove …` | undo one |
+| `hide fast run <cmd> [args…]` | run one command in the fast lane (a game: `hide fast run ./game`). Opens the lane for apps first if it's closed (sudo) |
+| `hide fast off` | close the lane: no sites, no apps, the proxy stops |
 | `hide check-rules` | can this kernel run hide? Checks every rule with `nft -c`, loads nothing (sudo) |
 | `global-proxy on\|off` | point KDE/GNOME/Chrome/Firefox proxy settings at Tor (setup turns it on) |
 | `hide-test [--rotation] [--full] [--docker]` | self-test, see below |
@@ -153,9 +160,10 @@ unprotected copy. Quit it fully first.
 
   Check them at `chrome://policy` / `about:policies`.
 - **`global-proxy on`** sets the KDE (kioslaverc; Chrome follows it) and GNOME proxy to
-  SOCKS 127.0.0.1:9050. Firefox gets a PAC that spreads tabs over the 5 Tor ports, in
-  every profile it finds (`~/.mozilla`, `~/.config/mozilla`, and the Flatpak's
-  `~/.var/app/org.mozilla.firefox`).
+  SOCKS 127.0.0.1:9050, or to the fast lane's 127.0.0.1:9049 while it has sites (see 5).
+  Firefox gets a PAC in every profile it finds (`~/.mozilla`, `~/.config/mozilla`, the
+  snap's and the Flatpak's). The PAC lists the 5 Tor ports in order, after 9049 when the
+  lane has sites; Firefox moves to the next one only when a port doesn't answer.
   - Any site your previous PAC sent to a proxy *on this machine* keeps that route (a local dev site, for example).
   - `off` restores exactly what was set before.
   - Firefox reads this at startup, so restart it.
@@ -164,6 +172,62 @@ unprotected copy. Quit it fully first.
 - **proxychains** (`proxychains4 <app>`) uses `random_chain` over the 5 ports and keeps
   `127.0.0.0/8` local (`localnet`), so an app's own localhost still works. It only works
   for dynamically linked apps; the jail works for everything.
+
+### 5. The fast lane — `hide fast` (off until you use it)
+
+Tor makes video slow and drops UDP, so calls and games fail. The fast lane lets the sites
+and apps you choose **skip Tor**. Everything else stays on Tor.
+
+```
+browser ──► 127.0.0.1:9049 hide-fast-proxy ──┬─ youtube.com, twitch.tv… ──► direct (fast)
+                                             └─ every other site ─────────► Tor (9050)
+hide fast run discord ──► group hide-fast ─────── TCP + UDP ───────────────► direct
+everything else ────────────────────────────────────────────────────────────► Tor
+```
+
+**What it costs.** What's in the lane sees your real IP: YouTube (Google), Twitch, Discord,
+and the game servers you play on. While apps are in the lane (`FAST_APPS=on`), any program
+running as you could also start itself with `hide fast run` and go direct. Nothing can
+stop that without a password on every launch. That's why the lane starts closed, and why
+`hide fast off` closes it.
+
+**Sites** go through `hide-fast-proxy`, a SOCKS5 proxy on 127.0.0.1:9049. It is
+`hide-fast.service`, running as the system user `hide-fast`, and it only runs while
+`FAST_SITES` has something. A request goes direct only when it:
+- names a host (not an address) on port 80 or 443;
+- matches `FAST_SITES` by whole labels: `www.youtube.com` matches `youtube.com`,
+  `evilyoutube.com` and `youtube.com.evil.net` don't;
+- resolves to public addresses only (no LAN, loopback or carrier-grade NAT).
+
+Anything else is passed to Tor's SOCKS port 9050 exactly as it came, so Tor still resolves
+the name. BIND and UDP ASSOCIATE are refused, and the proxy never logs a host name.
+`youtube` and `twitch` are keywords for the domains their videos come from
+(`hide-fast-proxy --keywords`; the list is at the top of the file).
+- Browsers send everything to 9049, so the list lives in one place, `/etc/hide/hide.conf`.
+  While `global-proxy` is on, `hide fast add` and `remove` re-run it for you, so browsers
+  follow the lane.
+- Proxy down? Chrome and KDE/GNOME apps fail (closed, never direct). Firefox moves on to
+  Tor's 9050.
+- TCP only: YouTube's QUIC falls back to TCP. It's still fast: no 3 relays in the way.
+
+**Apps** go through `hide fast run`, or through a launcher written by `hide fast add <app>`
+(`Exec=hide fast run --app …`, " (fast)" in its name). `hide fast run` asks
+`sudo -n /usr/local/libexec/hide-jail --fast`, the same helper as the jail, under the same
+sudoers line. The helper refuses unless `FAST_APPS=on`, then starts the command as you, with
+the `hide-fast` group as your primary group (`setpriv --regid`).
+- In global mode, two rules exempt that group, only while the lane is in use:
+  `meta skgid hide-fast return` in `nat_out` and `meta skgid hide-fast accept` in
+  `filter_out`. TCP, UDP and IPv6 then leave directly.
+- They come after the rules that send DNS to Tor and block Tor's control ports, UPnP and
+  NAT-PMP. So for an app in the lane, your ISP still doesn't see the names it looks up,
+  it can't ask your router for your public IP, and it can't drive Tor.
+- With global mode off, nothing needs exempting: the app simply runs as normal.
+- The jail can never reach the lane. The jail sends its 127.0.0.1:9049 to Tor's 9050, and
+  `hide-jail --fast` doesn't change network namespace, so a jailed app that calls
+  `hide fast run` stays in the jail.
+- Side effect: files a fast app creates belong to the `hide-fast` group. You still own them.
+- A launcher refuses to start the app if it already runs outside the lane: quit it fully
+  first, as with the jail.
 
 ## Verify — `hide-test`
 
@@ -179,7 +243,8 @@ no check failed; warnings and skips are listed but don't fail it.
 | 4. Jail | Tor; the 5 SOCKS ports work from inside (proxy settings); DNS to the server in `/etc/resolv.conf` works; only jail addresses are visible; STUN/WebRTC UDP gets no answer (with a positive control proving the probe works); no IPv6; your router is unreachable; routing guard present. A WARN when name lookups bypass DNS packets (`nss-resolve`, `nscd`; see Limits) |
 | 5. Global | you and root with no proxy reach Tor; a DNS query to an unroutable address is answered (all DNS captured), also from a socket pinned to the network card (SKIP on kernels older than 5.7, which refuse the pin); STUN, UPnP and NAT-PMP get `EPERM`; no IPv6; every live internet connection of your apps has its twin on Tor's TransPort (names the apps, never addresses); no interface holds a public address. `--docker`: a container reaches Tor |
 | 6. Browsers | the policy files exist, parse, and hold the right values |
-| 7. `--full` | stops the engine and checks that jailed and global traffic now **fail** (closed, not direct), then restarts it |
+| 7. Fast lane | only while it's in use. The proxy runs as `hide-fast` and passes `--self-test`; a site that isn't in the lane, through 9049, still reaches Tor, also from the jail; a site in the lane leaves no twin on Tor's TransPort (it went direct). Apps: in global mode a `hide fast run` UDP send is allowed and its DNS still answered by Tor; `hide run hide fast run` still reaches Tor. Apps off: the helper refuses |
+| 8. `--full` | stops the engine and checks that jailed and global traffic now **fail** (closed, not direct), then restarts it |
 
 ## What global mode breaks (honest list)
 
@@ -188,7 +253,8 @@ no check failed; warnings and skips are listed but don't fail it.
 - **Anything that needs UDP.** NTP (the clock slowly drifts; sync it now and then with
   global off), WireGuard/OpenVPN-over-UDP, voice and video calls (they fall back to TCP
   relays or fail), games, captive-portal Wi-Fi logins (turn global off to log in).
-  Browsers fall back from QUIC to TCP on their own.
+  Browsers fall back from QUIC to TCP on their own. Calls and games work in the fast
+  lane (`hide fast add discord`, `hide fast run ./game`), without Tor.
 - **Machines without a battery-backed clock** (Raspberry Pi and other boards). They boot
   with a stale date, Tor refuses to connect with a clock that wrong, and NTP is blocked:
   nothing comes up. Set the date first (`hide-rescue`, let NTP sync, then `hide global on`),
@@ -242,6 +308,9 @@ no check failed; warnings and skips are listed but don't fail it.
 - **Who you are, as opposed to where you are.** Logins, cookies, browser fingerprinting
   and the content you post identify you whatever your IP. Use separate profiles or
   containers for identities you want kept apart.
+- **The fast lane** (`hide fast`) skips Tor on purpose: its sites and apps see your real
+  IP. While apps are in it, any program running as you could use `hide fast run` too.
+  `hide fast off` closes it, and `hide-test` counts the live connections that use it.
 - **Turning it off.** `hide global off`, `systemctl stop hide` and uninstall all remove
   the protection. That is what they are for.
 - **The `ipchanger` uid** is allowed out directly. `hide-test` fails if anything other
@@ -276,11 +345,13 @@ no check failed; warnings and skips are listed but don't fail it.
 |---|---|
 | `/etc/hide/hide.conf` | settings (kept across re-installs) |
 | `/usr/local/bin/{hide,hide-test,hide-rescue,global-proxy}` | commands |
-| `/usr/local/libexec/hide-jail` | the one root step of `hide run` |
+| `/usr/local/libexec/hide-jail` | the one root step of `hide run` and `hide fast run` |
+| `/usr/local/libexec/hide-fast-proxy` | the fast lane's proxy for sites (127.0.0.1:9049) |
 | `/usr/local/lib/ip-changer/ip-changer-linux.sh` | engine (root-owned) |
 | `/usr/local/lib/ip-changer/bridges/{obfs4,snowflake}.txt` | Tor Browser's built-in bridge lines |
 | `/etc/hide/bridges.txt` | your own bridge lines, after `hide bridges FILE` |
-| `/etc/systemd/system/{hide,ip-changer}.service` | boot services |
+| `/etc/systemd/system/{hide,ip-changer,hide-fast}.service` | boot services (`hide-fast` only while the lane has sites) |
+| users `ipchanger`, `hide-fast` | system users for the engine and the fast lane, removed by uninstall |
 | `/etc/sudoers.d/hide` | `NOPASSWD` for `hide-jail` only |
 | `/etc/{opt/chrome,chromium,chromium-browser,brave}/policies/managed/hide-webrtc.json` | Chrome-family WebRTC policy |
 | `/etc/firefox/policies/policies.json` | Firefox locked prefs (merged into an existing file) |
