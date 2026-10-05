@@ -102,7 +102,7 @@ mkdirs() {
     done
 }
 
-pm_install() {
+pm_try() {
     if command -v apt-get >/dev/null; then
         [ -n "${APT_UPDATED:-}" ] || apt-get update -q
         APT_UPDATED=1
@@ -116,6 +116,16 @@ pm_install() {
     else
         return 1
     fi
+}
+
+# Downloads fail now and then (a mirror hiccup; through Tor, a slow circuit): one more try,
+# with a fresh package index.
+pm_install() {
+    pm_try "$@" && return
+    echo "setup.sh: installing $* failed; trying once more in 10 s" >&2
+    sleep 10
+    APT_UPDATED=""
+    pm_try "$@"
 }
 
 have() {
