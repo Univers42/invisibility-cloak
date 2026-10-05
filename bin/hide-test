@@ -37,15 +37,29 @@ route=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1)
 dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route")
 gw=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<<"$route")
 
-# Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true.
-# A fresh circuit sometimes fails once: a failed connection gets one retry. An answer that
-# isn't Tor's gets none (that would be a leak).
+# Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true,
+# else print why not (never an address) and fail. A fresh circuit sometimes fails once: a
+# failed fetch gets one more try, 5 s later. An IsTor:false answer gets none (that's a leak).
 tor_ip() {
-    local r
-    r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || return 1
-    [[ $r == *'"IsTor":true'* ]] || return 1
-    r=${r#*\"IP\":\"}
-    printf '%s\n' "${r%%\"*}"
+    local r rc try
+    for try in 1 2; do
+        r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) && rc=0 || rc=$?
+        if [[ $r == *'"IsTor":true'* ]]; then
+            r=${r#*\"IP\":\"}
+            printf '%s\n' "${r%%\"*}"
+            return 0
+        fi
+        [[ $r != *'"IsTor":false'* ]] || { echo 'check.torproject.org said "IsTor":false'; return 1; }
+        ((try == 2)) || sleep 5
+    done
+    case $rc in
+        0) echo "the answer wasn't check.torproject.org's" ;;
+        7) echo "port closed" ;;
+        28) echo "timed out" ;;
+        97) echo "Tor couldn't reach the site" ;;
+        *) echo "curl error $rc" ;;
+    esac
+    return 1
 }
 
 # "<label> <cmd…>": the command must NOT reach the internet. Seeing IsTor:false would mean
@@ -203,7 +217,7 @@ fi
 section "2. SOCKS ports (proxy-aware apps, browsers via global-proxy)"
 declare -A exits=()
 for p in 9050 9060 9070 9080 9090; do
-    if ip=$(tor_ip curl --socks5-hostname "127.0.0.1:$p"); then ok "socks $p → Tor exit $ip" && exits[$ip]=1; else bad "socks $p: not through Tor"; fi
+    if ip=$(tor_ip curl --socks5-hostname "127.0.0.1:$p"); then ok "socks $p → Tor exit $ip" && exits[$ip]=1; else bad "socks $p: not through Tor ($ip)"; fi
 done
 [ "${#exits[@]}" -le 1 ] || ok "${#exits[@]} different exits across the 5 ports"
 if [ "$rotation" = 1 ]; then
@@ -212,8 +226,8 @@ if [ "$rotation" = 1 ]; then
         sleep $((rotate + 5))
         if b=$(tor_ip curl --socks5-hostname 127.0.0.1:9050); then
             if [ "$a" != "$b" ]; then ok "exit rotated: $a → $b"; else meh "same exit after ${rotate}s ($a): Tor may pick the same exit again; rerun"; fi
-        else bad "rotation: no Tor answer the second time"; fi
-    else bad "rotation: not through Tor"; fi
+        else bad "rotation: no Tor answer the second time ($b)"; fi
+    else bad "rotation: not through Tor ($a)"; fi
 fi
 
 section "3. proxychains (terminal apps: proxychains4 <cmd>)"
@@ -221,7 +235,7 @@ pc=$(command -v proxychains4 || command -v proxychains || true)
 if [ -z "$pc" ]; then
     bad "proxychains not installed"
 else
-    if ip=$(tor_ip "$pc" -q curl); then ok "proxychains curl → Tor exit $ip"; else bad "proxychains curl: not through Tor"; fi
+    if ip=$(tor_ip "$pc" -q curl); then ok "proxychains curl → Tor exit $ip"; else bad "proxychains curl: not through Tor ($ip)"; fi
     port=$((20000 + RANDOM % 20000))
     www=$(mktemp -d)
     python3 -m http.server --bind 127.0.0.1 --directory "$www" "$port" >/dev/null 2>&1 &
@@ -237,13 +251,13 @@ section "4. Tor jail (hide run / jailed launchers)"
 if ! command -v hide >/dev/null; then
     bad "hide not installed"
 else
-    if ip=$(tor_ip hide run curl); then ok "hide run curl → Tor exit $ip"; else bad "hide run curl: not through Tor"; fi
+    if ip=$(tor_ip hide run curl); then ok "hide run curl → Tor exit $ip"; else bad "hide run curl: not through Tor ($ip)"; fi
     n=0 miss=""
     for p in 9050 9060 9070 9080 9090; do
-        if tor_ip hide run curl --socks5-hostname "127.0.0.1:$p" >/dev/null; then n=$((n + 1)); else miss="$miss $p"; fi
+        if r=$(tor_ip hide run curl --socks5-hostname "127.0.0.1:$p"); then n=$((n + 1)); else miss="${miss:+$miss, }$p: $r"; fi
     done
     if [ "$n" = 5 ]; then ok "proxy settings work in the jail (127.0.0.1:9050-9090 → Tor SOCKS)"
-    else bad "$n/5 SOCKS ports reachable from the jail (not:$miss): jailed browsers/Electron apps using global-proxy won't load"; fi
+    else bad "$n/5 SOCKS ports reachable from the jail ($miss): jailed browsers/Electron apps using global-proxy won't load"; fi
     ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
     if [ -z "$ns" ]; then skp "DNS in the jail: no IPv4 nameserver in /etc/resolv.conf to ask"
     else
@@ -275,9 +289,9 @@ section "5. Global mode ($global)"
 if [ "$global" = off ]; then
     skp "GLOBAL=off in $CONF: only jailed apps and proxy users are protected"
 else
-    if ip=$(tor_ip curl --noproxy '*'); then ok "you, no proxy settings → Tor exit $ip"; else bad "you, no proxy: not through Tor"; fi
+    if ip=$(tor_ip curl --noproxy '*'); then ok "you, no proxy settings → Tor exit $ip"; else bad "you, no proxy: not through Tor ($ip)"; fi
     if sudo -n true 2>/dev/null; then
-        if ip=$(tor_ip sudo -n curl --noproxy '*'); then ok "root, no proxy settings → Tor exit $ip"; else bad "root, no proxy: not through Tor"; fi
+        if ip=$(tor_ip sudo -n curl --noproxy '*'); then ok "root, no proxy settings → Tor exit $ip"; else bad "root, no proxy: not through Tor ($ip)"; fi
     else skp "root check needs sudo"; fi
     r=$(probe dns 192.0.2.1)
     if [ "$r" = answer ]; then ok "DNS to any server is answered by Tor (query to unroutable 192.0.2.1 answered)"; else bad "DNS capture: ${r:-no answer}"; fi
@@ -308,7 +322,7 @@ else
     if [ "$docker" = 1 ]; then
         if ! command -v docker >/dev/null; then skp "docker not installed"
         elif ip=$(tor_ip docker run --rm --network bridge curlimages/curl); then ok "docker container (bridge) → Tor exit $ip"
-        else bad "docker container: not through Tor"; fi
+        else bad "docker container: not through Tor ($ip)"; fi
     fi
 fi
 
