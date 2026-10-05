@@ -193,15 +193,17 @@ curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
 The proxies are `127.0.0.1:9050`, `9060`, `9070`, `9080` and `9090`. Point your browser at one,
 or use `proxychains4`. Ctrl+C stops everything.
 
-**Android (Termux):** the same one-liner installs the original ip-changer, with Tor and an
-HTTP proxy:
+**Android (Termux):** the same one-liner installs the same level-0 engine, with the bridge
+programs (`--bridges` works there too):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Univers42/invisibility-cloak/main/installer.sh | bash
-ip-changer -r 15                  # then set apps' HTTP proxy to 127.0.0.1:8118
+ip-changer -r 15                  # SOCKS5 127.0.0.1:9050-9090, HTTPS proxy 127.0.0.1:8118
 ```
 
-(The Termux path is written but not tested on a real phone yet. Reports welcome.)
+Apps that only take an HTTP proxy can use `127.0.0.1:8118`. It's Tor's own, and carries
+`https://` only: plain `http://` needs SOCKS. (Tested in Termux's Docker image, not on a real
+phone yet. Reports welcome.)
 
 ## 🧹 Uninstall
 
@@ -324,14 +326,16 @@ at a time. Start by explaining this plan to me in 5 short lines.
      Never pipe a download into bash.
    - LEVEL 0 ends in this step, then jump to step 9:
      Termux: ask, then run: bash installer.sh
-       It installs tor, privoxy, curl and netcat with pkg, and adds the command ip-changer.
+       It installs tor, curl, netcat, procps and the bridge programs (lyrebird, snowflake)
+       with pkg, and adds the command ip-changer.
        Ask me to open a second Termux session and run ip-changer -r 15 there (it keeps
        running; Ctrl+C stops it). Its "New IP" lines are Tor exits fetched through its own
        proxy, not my address. After a minute, run both:
          curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
          curl --proxy http://127.0.0.1:8118 https://check.torproject.org/api/ip
-       Both must say "IsTor":true. Tell me to set each app's HTTP proxy to 127.0.0.1:8118,
-       and that the README says the Termux path isn't tested on a real phone yet.
+       Both must say "IsTor":true. Tell me to point apps at SOCKS5 127.0.0.1:9050, or at
+       the HTTPS proxy 127.0.0.1:8118 if they take nothing else (https:// sites only), and
+       that the Termux path is tested in Termux's Docker image, not on a real phone yet.
      Linux level 0: it needs tor, curl and nc (netcat). Missing? Ask, then install them with
        the package manager (or ask me to, if I have no sudo). Ask me to open a second
        terminal in the clone and run bash ip-changer-linux.sh -r 15 there (Ctrl+C stops it).
