@@ -183,9 +183,9 @@ hide bridges off
 
 If Tor won't start with the new bridges, the old setting comes back by itself. The program
 each one needs is installed by `sudo ./setup.sh install --bridges obfs4` (or `snowflake`).
-Two exceptions: Arch has them in the AUR only (`lyrebird-proxy`, `snowflake-pt-client`:
-install one with your AUR helper first), and Fedora and openSUSE have no snowflake client
-package (obfs4 works; openSUSE's `snowflake` package is the volunteer proxy, not the client).
+Two exceptions: Arch has them in the AUR only (`lyrebird-proxy` runs both: install it with
+your AUR helper first), and Fedora and openSUSE have no snowflake client package (obfs4 works;
+openSUSE's `snowflake` package is the volunteer proxy, not the client).
 
 ## 🐧 Works on
 
@@ -368,8 +368,8 @@ at a time. Start by explaining this plan to me in 5 short lines.
      Never pipe a download into bash.
    - LEVEL 0 ends in this step, then jump to step 10:
      Termux: ask, then run: bash installer.sh
-       It installs tor, curl, netcat, procps and the bridge programs (lyrebird, snowflake)
-       with pkg, and adds the command ip-changer.
+       It installs tor, curl, netcat, procps and lyrebird (the bridge program, for obfs4
+       and snowflake) with pkg, and adds the command ip-changer.
        Ask me to open a second Termux session and run ip-changer -r 15 there (it keeps
        running; Ctrl+C stops it). Its "New IP" lines are Tor exits fetched through its own
        proxy, not my address. After a minute, run both:
@@ -409,8 +409,8 @@ at a time. Start by explaining this plan to me in 5 short lines.
    b) Is Tor blocked where I am (some countries, schools, offices)? Then I need bridges,
       which hide that I'm using Tor: obfs4 looks like random noise, snowflake like a video
       call. Not sure? No bridges for now; step 7 will tell.
-      Known gaps: on Arch both bridge programs are in the AUR only (lyrebird-proxy for
-      obfs4, snowflake-pt-client for snowflake): I install one with my AUR helper first.
+      Known gaps: on Arch the bridge program is in the AUR only (lyrebird-proxy, for
+      obfs4 and snowflake): I install it with my AUR helper first.
       Fedora and openSUSE have no snowflake client package: use obfs4 (openSUSE's
       "snowflake" package is the volunteer proxy, not the client: don't install it).
    c) Do I want a fast lane? Through Tor, YouTube and Twitch are slow, and calls (Discord)

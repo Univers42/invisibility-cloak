@@ -139,7 +139,7 @@ have() {
 
 # packages [BRIDGES]: what hide needs, plus the program for each bridge transport in use.
 packages() {
-    local c absent=0 t p aur
+    local c absent=0 t p
     local -a bins pkgs ts=()
     for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill awk; do have "$c" || absent=1; done
     have proxychains4 proxychains || absent=1
@@ -173,9 +173,11 @@ packages() {
     esac
     for t in "${ts[@]}"; do
         case $t in
-            obfs4 | webtunnel) bins=(lyrebird obfs4proxy) pkgs=(lyrebird obfs4proxy obfs4) aur=lyrebird-proxy ;;
+            # lyrebird runs obfs4, webtunnel and snowflake; obfs4proxy runs obfs4 only.
+            obfs4) bins=(lyrebird obfs4proxy) pkgs=(lyrebird obfs4proxy obfs4) ;;
+            webtunnel) bins=(lyrebird) pkgs=(lyrebird) ;;
             # Not "snowflake": on openSUSE that's the volunteer proxy, which carries other people's traffic.
-            snowflake) bins=(snowflake-client snowflake-pt-client) pkgs=(snowflake-client snowflake-pt-client) aur=snowflake-pt-client ;;
+            snowflake) bins=(snowflake-client snowflake-pt-client lyrebird) pkgs=(snowflake-client snowflake-pt-client lyrebird) ;;
             *) continue ;;
         esac
         have "${bins[@]}" && continue
@@ -187,7 +189,7 @@ packages() {
         done
         echo "setup.sh: couldn't install ${bins[*]} for $t bridges (no package here has it, or the download failed): install it yourself, or pick other bridges" >&2
         # Arch ships no bridge program; the AUR does, and AUR helpers don't run as root.
-        if have pacman; then echo "setup.sh: on Arch it's in the AUR: install $aur with your AUR helper, then re-run" >&2; fi
+        if have pacman; then echo "setup.sh: on Arch it's in the AUR: install lyrebird-proxy (it runs all three kinds) with your AUR helper, then re-run" >&2; fi
         exit 1
     done
 }

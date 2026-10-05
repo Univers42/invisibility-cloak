@@ -32,8 +32,8 @@ if [ -d /data/data/com.termux/files/usr ]; then
     # The same engine as on Linux. Tor itself also serves the HTTPS proxy on 8118 (HTTPTunnelPort).
     PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
     dir=$PREFIX/share/ip-changer
-    say "Termux: installing tor, curl, netcat, procps and the bridge programs (lyrebird, snowflake)"
-    pkg install -y tor curl netcat-openbsd procps lyrebird snowflake
+    say "Termux: installing tor, curl, netcat, procps and lyrebird (the bridge program: obfs4, webtunnel, snowflake)"
+    pkg install -y tor curl netcat-openbsd procps lyrebird
     download "$dir"
     cat >"$PREFIX/bin/ip-changer" <<EOF
 #!$PREFIX/bin/bash

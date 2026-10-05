@@ -65,9 +65,10 @@ uninstall turns it back on only if it was on before.
 - Its own traffic is the only traffic allowed to leave directly: the kernel rules
   exempt the `ipchanger` uid. Without that Tor would be sent into itself.
 - **Bridges** (`BRIDGES=`): `snowflake` and `obfs4` use the bridge lines built into Tor
-  Browser (`bridges/*.txt`, with their source and date). They need `snowflake-client`, or
-  `lyrebird`/`obfs4proxy`; `setup.sh install --bridges …` installs it. Arch has them in the
-  AUR only (`lyrebird-proxy`, `snowflake-pt-client`): setup names the package. Fedora and
+  Browser (`bridges/*.txt`, with their source and date). They need `lyrebird` (it runs both),
+  or `snowflake-client` for snowflake and `obfs4proxy` for obfs4; `setup.sh install --bridges …`
+  installs one, and the engine asks each program which kinds it runs, the way Tor does. Arch
+  has them in the AUR only (`lyrebird-proxy`): setup names the package. Fedora and
   openSUSE have no snowflake client package (obfs4 is fine; openSUSE's `snowflake` is the
   volunteer proxy, which setup won't install). These shared lines go stale over time: fresh
   private ones come from https://bridges.torproject.org (`hide bridges ./my-bridges.txt`).

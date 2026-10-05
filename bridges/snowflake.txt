@@ -1,4 +1,4 @@
-# Tor Browser's built-in snowflake bridges (needs snowflake-client (or lyrebird); uses UDP (WebRTC)).
+# Tor Browser's built-in snowflake bridges (needs snowflake-client or lyrebird; uses UDP (WebRTC)).
 # Source: tor-browser-build projects/tor-expert-bundle/pt_config.json @ cc59b89 (2026-10-04)
 # They change now and then: refresh from that file, or put your own lines from
 # https://bridges.torproject.org in a file and set BRIDGES=/path/to/that/file.
