@@ -29,15 +29,19 @@ download() {
 }
 
 if [ -d /data/data/com.termux/files/usr ]; then
-    # ip-changer.sh keeps its Tor and privoxy state next to itself: it has to live here.
+    # The same engine as on Linux. Tor itself also serves the HTTPS proxy on 8118 (HTTPTunnelPort).
     PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
     dir=$PREFIX/share/ip-changer
-    say "Termux: installing tor, privoxy, curl, netcat"
-    pkg install -y tor privoxy curl netcat-openbsd
+    say "Termux: installing tor, curl, netcat, procps and the bridge programs (lyrebird, snowflake)"
+    pkg install -y tor curl netcat-openbsd procps lyrebird snowflake
     download "$dir"
-    printf '#!%s/bin/bash\ncd "%s" && exec bash ip-changer.sh "$@"\n' "$PREFIX" "$dir" >"$PREFIX/bin/ip-changer"
+    cat >"$PREFIX/bin/ip-changer" <<EOF
+#!$PREFIX/bin/bash
+export IPCHANGER_HTTP_PORT=\${IPCHANGER_HTTP_PORT:-8118}
+exec bash "$dir/ip-changer-linux.sh" "\$@"
+EOF
     chmod 755 "$PREFIX/bin/ip-changer"
-    say "done: run ip-changer, then point apps at the HTTP proxy 127.0.0.1:8118 (privoxy → Tor)"
+    say "done: run ip-changer, then point apps at SOCKS5 127.0.0.1:9050, or the HTTPS proxy 127.0.0.1:8118"
     exit 0
 fi
 
