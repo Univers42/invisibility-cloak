@@ -107,7 +107,9 @@ A Linux **network namespace** named `hide` is connected to the host by a virtual
   the host (`route_localnet` on `hide0`). Tor's control ports are not forwarded.
 - **Fail closed twice.** A routing rule (`ip rule iif hide0 lookup 233` → `unreachable`)
   means jail packets can never be forwarded to the internet, even if every nftables
-  rule is flushed. The firewall also drops them.
+  rule is flushed. The firewall also drops them. The rule and its route are marked
+  `protocol kernel`, the mark systemd-networkd leaves alone when it cleans up other
+  programs' routing (`networkctl reload`).
 - The app keeps its own private `localhost`. proxychains, by contrast, can send an app's
   own localhost traffic into Tor (`127.0.0.1:<port> <--socket error or timeout!`). That
   cannot happen in the jail.
