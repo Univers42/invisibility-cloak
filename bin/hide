@@ -570,7 +570,7 @@ fast() {
         remove:site) echo "${w,,}: through Tor again." ;;
     esac
     # Browsers point at the fast-lane proxy only while it has sites: let global-proxy follow.
-    if [ "$kind" != app ] && [ -f "$STATE/proxy-before" ] && [ -x "$GLOBAL_PROXY" ]; then "$GLOBAL_PROXY" on >/dev/null || echo "hide: global-proxy on failed: run it yourself" >&2; fi
+    if [ "$kind" != app ] && [ -d "$STATE/proxy-before" ] && [ -x "$GLOBAL_PROXY" ]; then "$GLOBAL_PROXY" on >/dev/null || echo "hide: global-proxy on failed: run it yourself" >&2; fi
 }
 
 case "${1:-status}" in
