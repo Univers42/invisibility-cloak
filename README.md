@@ -274,6 +274,13 @@ next one if one stops answering.
 **Can I use a VPN too?** A VPN over TCP works in global mode; it then runs *inside* Tor.
 UDP VPNs (WireGuard) are blocked by global mode.
 
+**"Could not resolve host: github.com", now and then?** In global mode, Tor's exits do your
+DNS, and a few of them get it wrong: about 1 in 40 said github.com doesn't exist. `hide-dns`
+catches that. When an exit says "no such name" or doesn't answer, it asks a second exit, so
+a `git clone --recursive` no longer loses submodules. If a lookup still fails, run the
+command again (for a clone: `git submodule update --init --recursive`). Tor changes
+circuits every `ROTATE` seconds.
+
 **Tor inside a container, on a cloaked host?** That's Tor over Tor, and Tor exit relays
 refuse to connect to other relays: the inner Tor stays stuck at 10%. Give it bridges, which
 aren't public relays: `--bridges obfs4`.

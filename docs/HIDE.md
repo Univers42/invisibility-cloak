@@ -60,8 +60,18 @@ uninstall turns it back on only if it was on before.
 
 - 5 Tor instances: SOCKS ports 9050, 9060, 9070, 9080, 9090. Every `ROTATE` seconds
   each is told `NEWNYM`, so new connections leave from a different exit.
-- Instance 0 also opens a **TransPort** (9040) and a **DNSPort** (9053). The kernel
-  rules below redirect ordinary traffic into these two, so apps need no proxy setting.
+- Instance 0 also opens a **TransPort** (9040) and two **DNSPorts** (127.0.0.1:9054 and
+  9055). The kernel rules below redirect ordinary traffic into the TransPort and into
+  **`hide-dns`** (9053), so apps need no proxy setting.
+- `hide-dns` is there because Tor's DNSPort passes on whatever the exit says, and a few
+  exits are wrong: about 1 in 40 said github.com doesn't exist. Every lookup then failed the
+  same way until the next `NEWNYM`, and `git clone --recursive` lost half its submodules.
+  `hide-dns` asks 9054 first. If the answer is "no such name", a server failure, or slow
+  (3 s), it also asks 9055, which Tor keeps on other circuits, so another exit. The first
+  good answer wins, and "no such name" stands only when both exits say it. It runs as a user
+  systemd makes up (`DynamicUser`), so global mode does not exempt it. It starts, stops and
+  restarts with `ip-changer.service`, and it never logs names. `hide-dns --self-test`
+  checks it against two fake DNSPorts.
 - Its own traffic is the only traffic allowed to leave directly: the kernel rules
   exempt the `ipchanger` uid. Without that Tor would be sent into itself.
 - **Bridges** (`BRIDGES=`): `snowflake` and `obfs4` use the bridge lines built into Tor
@@ -84,7 +94,7 @@ It loads one nftables table, atomically:
 | Traffic | What happens |
 |---|---|
 | TCP to the internet, any user | sent to Tor's TransPort 9040 |
-| DNS (port 53) to *any* server, LAN routers included | sent to Tor's DNSPort 9053 |
+| DNS (port 53) to *any* server, LAN routers included | sent to `hide-dns` (9053), which asks Tor |
 | Any other UDP (QUIC, STUN/WebRTC, NTP, games, VPNs), ICMP, global IPv6 | dropped. Local programs get `EPERM`, so they fail at once instead of hanging |
 | UPnP (1900) / NAT-PMP (5351) to your router | dropped. Those protocols hand out your public IP |
 | Containers and VMs (bridge, veth, vxlan: Docker, k8s, libvirt) | TCP and DNS redirected the same way; anything else forwarded to the internet is dropped |
@@ -106,10 +116,10 @@ A Linux **network namespace** named `hide` is connected to the host by a virtual
 
 - Inside, an app sees only `lo` and `10.233.233.2`. It cannot read your LAN or public
   address, it has no IPv6, and it cannot reach your LAN or router.
-- Everything the jail sends is redirected to Tor on the host side: TCP → 9040, DNS → 9053.
+- Everything the jail sends is redirected to Tor on the host side: TCP → 9040, DNS → 9053 (`hide-dns`).
 - DNS: `/etc/resolv.conf` usually names a resolver on loopback (127.0.0.53 with
   systemd-resolved, 127.0.1.1 or 127.0.0.1 with dnsmasq), which inside the jail is the
-  jail's own loopback. A rule inside the jail forwards those queries to Tor's DNSPort.
+  jail's own loopback. A rule inside the jail forwards those queries to `hide-dns`.
   This also works for snaps, which ignore mount tricks.
 - Proxy settings: `global-proxy` points browsers and Electron apps at `127.0.0.1:9050`,
   which is also the jail's own loopback. The jail forwards the 5 SOCKS ports to Tor on
@@ -238,7 +248,7 @@ no check failed; warnings and skips are listed but don't fail it.
 
 | Section | Checks |
 |---|---|
-| 1. Engine | both services up; ports 9050–9090, 9040 and 9053 owned by `ipchanger`; nothing else runs as that exempt uid |
+| 1. Engine | both services up; ports 9050–9090, 9040, 9054 and 9055 owned by `ipchanger`; `hide-dns` up on 9053 as another user, and its self-test; nothing else runs as that exempt uid |
 | 2. SOCKS | all 5 ports reach Tor; how many distinct exits. `--rotation`: the exit changes after `ROTATE` (a WARN if Tor picked the same one) |
 | 3. proxychains | reaches Tor, **and** a local web server is still reachable through it (localhost stays local) |
 | 4. Jail | Tor; the 5 SOCKS ports work from inside (proxy settings); DNS to the server in `/etc/resolv.conf` works; only jail addresses are visible; STUN/WebRTC UDP gets no answer (with a positive control proving the probe works); no IPv6; your router is unreachable; routing guard present. A WARN when name lookups bypass DNS packets (`nss-resolve`, `nscd`; see Limits) |
@@ -348,10 +358,11 @@ no check failed; warnings and skips are listed but don't fail it.
 | `/usr/local/bin/{hide,hide-test,hide-rescue,global-proxy}` | commands |
 | `/usr/local/libexec/hide-jail` | the one root step of `hide run` and `hide fast run` |
 | `/usr/local/libexec/hide-fast-proxy` | the fast lane's proxy for sites (127.0.0.1:9049) |
+| `/usr/local/libexec/hide-dns` | DNS on 9053: Tor's answer, and a second exit's when the first says "no such name" |
 | `/usr/local/lib/ip-changer/ip-changer-linux.sh` | engine (root-owned) |
 | `/usr/local/lib/ip-changer/bridges/{obfs4,snowflake}.txt` | Tor Browser's built-in bridge lines |
 | `/etc/hide/bridges.txt` | your own bridge lines, after `hide bridges FILE` |
-| `/etc/systemd/system/{hide,ip-changer,hide-fast}.service` | boot services (`hide-fast` only while the lane has sites) |
+| `/etc/systemd/system/{hide,ip-changer,hide-dns,hide-fast}.service` | boot services (`hide-dns` with `ip-changer`; `hide-fast` only while the lane has sites) |
 | users `ipchanger`, `hide-fast` | system users for the engine and the fast lane, removed by uninstall |
 | `/etc/sudoers.d/hide` | `NOPASSWD` for `hide-jail` only |
 | `/etc/{opt/chrome,chromium,chromium-browser,brave}/policies/managed/hide-webrtc.json` | Chrome-family WebRTC policy |
