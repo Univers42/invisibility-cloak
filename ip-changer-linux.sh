@@ -168,7 +168,9 @@ EOF
     if [[ -n "$BRIDGE_CONF" ]]; then printf '%s\n' "$BRIDGE_CONF" >> "$TOR_DIR/torrc"; fi
     # The service also makes instance 0 the transparent proxy used by `hide` (global mode + app jail).
     if [[ $i -eq 0 && -n "${IPCHANGER_TRANS_PORT:-}" ]]; then
-        printf 'TransPort %s IsolateDestAddr\nDNSPort %s\n' "$IPCHANGER_TRANS_PORT" "$IPCHANGER_DNS_PORT" >> "$TOR_DIR/torrc"
+        # One DNSPort per address given: Tor keeps each port on circuits of its own (hide-dns).
+        read -ra dns_ports <<<"$IPCHANGER_DNS_PORT"
+        { echo "TransPort $IPCHANGER_TRANS_PORT IsolateDestAddr"; printf 'DNSPort %s\n' "${dns_ports[@]}"; } >> "$TOR_DIR/torrc"
     fi
     # Tor's own HTTP CONNECT proxy, for apps (Android's Wi-Fi proxy setting) that can't do SOCKS.
     if [[ $i -eq 0 && -n "${IPCHANGER_HTTP_PORT:-}" ]]; then echo "HTTPTunnelPort $IPCHANGER_HTTP_PORT" >> "$TOR_DIR/torrc"; fi

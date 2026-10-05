@@ -14,12 +14,13 @@ jobs:
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           shellcheck -x -S style "${files[@]}"
-      - name: python syntax, and the fast-lane proxy's own self-test
+      - name: python syntax, and the self-tests of the fast-lane proxy and hide-dns
         run: |
           mapfile -t py < <(git ls-files | while read -r f; do head -n1 "$f" | grep -qE '^#!.*python' && echo "$f"; done)
           printf '%s\n' "${py[@]}"
           for f in "${py[@]}"; do python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"; done
           bin/hide-fast-proxy --self-test
+          bin/hide-dns --self-test
 
   # The kernel side: every global-mode and jail rule, checked by nft without loading anything.
   rules:

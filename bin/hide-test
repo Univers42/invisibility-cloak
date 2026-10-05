@@ -249,7 +249,15 @@ else
     for p in 9050 9060 9070 9080 9090 9040; do
         if ss -Hltne "sport = :$p" | grep -q "uid:$uid "; then ok "tcp $p listening, owned by $ENGINE"; else bad "tcp $p not listening as $ENGINE"; fi
     done
-    if ss -Hlune 'sport = :9053' | grep -q "uid:$uid "; then ok "udp 9053 (DNS) listening, owned by $ENGINE"; else bad "udp 9053 not listening as $ENGINE"; fi
+    for p in 9054 9055; do
+        if ss -Hlune "sport = :$p" | grep -q "uid:$uid "; then ok "udp $p (Tor DNS) listening, owned by $ENGINE"; else bad "udp $p not listening as $ENGINE"; fi
+    done
+    # hide-dns runs as a user systemd makes up: not the engine's, so global mode doesn't exempt it.
+    line=$(ss -Hlune 'sport = :9053')
+    if systemctl is-active --quiet hide-dns && [ -n "$line" ] && ! grep -q "uid:$uid " <<<"$line"; then
+        ok "hide-dns.service active on udp 9053, not as $ENGINE"
+    else bad "hide-dns.service not active on udp 9053 (or running as $ENGINE)"; fi
+    if /usr/local/libexec/hide-dns --self-test >/dev/null 2>&1; then ok "hide-dns --self-test (a second exit when the first says \"no such name\")"; else bad "hide-dns --self-test failed"; fi
     # Global mode exempts this uid: nothing else on this machine's network may run under it.
     # A container's process with the same uid number has its own network: not exempt, not counted.
     stray=0 hostns=$(readlink /proc/self/ns/net)
@@ -310,7 +318,7 @@ else
     if [ -z "$ns" ]; then skp "DNS in the jail: no IPv4 nameserver in /etc/resolv.conf to ask"
     else
         r=$(hide run python3 -c "$PROBE" dns "$ns" 2>/dev/null)
-        if [ "$r" = answer ]; then ok "DNS works inside the jail (resolv.conf's $ns → Tor DNSPort)"; else bad "DNS in the jail: ${r:-no answer}"; fi
+        if [ "$r" = answer ]; then ok "DNS works inside the jail (resolv.conf's $ns → hide-dns → Tor)"; else bad "DNS in the jail: ${r:-no answer}"; fi
     fi
     if [ "$global" = off ] && { grep -Eqs '^hosts:.*[[:space:]]resolve' /etc/nsswitch.conf || [ -S /run/nscd/socket ]; }; then
         meh "apps here look names up through a local socket (nss-resolve or nscd) the jail can't redirect: your DNS server sees jailed apps' lookups (not their traffic). Global mode closes this"
