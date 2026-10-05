@@ -38,9 +38,11 @@ dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route")
 gw=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<<"$route")
 
 # Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true.
+# A fresh circuit sometimes fails once: a failed connection gets one retry. An answer that
+# isn't Tor's gets none (that would be a leak).
 tor_ip() {
     local r
-    r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || return 1
+    r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) || return 1
     [[ $r == *'"IsTor":true'* ]] || return 1
     r=${r#*\"IP\":\"}
     printf '%s\n' "${r%%\"*}"
@@ -236,10 +238,12 @@ if ! command -v hide >/dev/null; then
     bad "hide not installed"
 else
     if ip=$(tor_ip hide run curl); then ok "hide run curl → Tor exit $ip"; else bad "hide run curl: not through Tor"; fi
-    n=0
-    for p in 9050 9060 9070 9080 9090; do tor_ip hide run curl --socks5-hostname "127.0.0.1:$p" >/dev/null && n=$((n + 1)); done
+    n=0 miss=""
+    for p in 9050 9060 9070 9080 9090; do
+        if tor_ip hide run curl --socks5-hostname "127.0.0.1:$p" >/dev/null; then n=$((n + 1)); else miss="$miss $p"; fi
+    done
     if [ "$n" = 5 ]; then ok "proxy settings work in the jail (127.0.0.1:9050-9090 → Tor SOCKS)"
-    else bad "$n/5 SOCKS ports reachable from the jail: jailed browsers/Electron apps using global-proxy won't load"; fi
+    else bad "$n/5 SOCKS ports reachable from the jail (not:$miss): jailed browsers/Electron apps using global-proxy won't load"; fi
     ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
     if [ -z "$ns" ]; then skp "DNS in the jail: no IPv4 nameserver in /etc/resolv.conf to ask"
     else
