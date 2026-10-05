@@ -46,7 +46,7 @@ jobs:
       - run: bash ./setup.sh deps --bridges ${{ matrix.bridges }}
       - name: every program hide uses is there
         run: |
-          for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill; do command -v "$c"; done
+          for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill awk; do command -v "$c"; done
           command -v proxychains4 || command -v proxychains
           if [ "${{ matrix.bridges }}" = obfs4 ]; then command -v lyrebird || command -v obfs4proxy; fi
 
