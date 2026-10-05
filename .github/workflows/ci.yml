@@ -14,6 +14,12 @@ jobs:
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           shellcheck -x -S style "${files[@]}"
+      - name: python syntax, and the fast-lane proxy's own self-test
+        run: |
+          mapfile -t py < <(git ls-files | while read -r f; do head -n1 "$f" | grep -qE '^#!.*python' && echo "$f"; done)
+          printf '%s\n' "${py[@]}"
+          for f in "${py[@]}"; do python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"; done
+          bin/hide-fast-proxy --self-test
 
   # The kernel side: every global-mode and jail rule, checked by nft without loading anything.
   rules:
@@ -70,4 +76,15 @@ jobs:
           done
       - run: hide-test
       - run: hide status
+      - name: the fast lane, sites and apps, then closed again
+        run: |
+          hide fast add youtube
+          hide fast run true
+          hide fast
+          hide-test
+          hide fast off
       - run: sudo ./setup.sh uninstall
+      - name: nothing left behind
+        run: |
+          for u in ipchanger hide-fast; do if getent passwd "$u"; then echo "user $u left behind"; exit 1; fi; done
+          if systemctl cat hide-fast.service >/dev/null 2>&1; then echo "hide-fast.service left behind"; exit 1; fi
