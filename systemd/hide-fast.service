@@ -1,0 +1,21 @@
+[Unit]
+Description=hide fast lane: SOCKS 9049, sites in FAST_SITES direct, everything else to Tor
+Documentation=file:///usr/local/share/doc/hide/HIDE.md
+Wants=network-online.target
+After=network-online.target hide.service
+
+[Service]
+# Its own group: global mode lets the hide-fast gid out directly while the fast lane is in use.
+User=hide-fast
+Group=hide-fast
+EnvironmentFile=/etc/hide/hide.conf
+ExecStart=/usr/local/libexec/hide-fast-proxy
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
