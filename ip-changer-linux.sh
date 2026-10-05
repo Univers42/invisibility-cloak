@@ -43,6 +43,10 @@ usage() {
     echo -e "${BLUE}Options:${RESET}"
     echo -e "  -r SECONDS  Set IP rotation interval (default: 10 seconds, min: 5 seconds)"
     echo -e "  -h          Show this help message"
+    echo -e "Environment:"
+    echo -e "  BRIDGES=snowflake|obfs4|FILE   reach Tor where it's blocked"
+    echo -e "  IPCHANGER_BASE_PORT=9050       SOCKS ports BASE, BASE+10 … BASE+40 (control ports: each +1)"
+    echo -e "  IPCHANGER_HTTP_PORT=8118       also an HTTPS (CONNECT) proxy on that port, for apps without SOCKS"
     echo -e "\n${GREEN}Available SOCKS5 proxies:${RESET}"
     echo -e "127.0.0.1:9050 (Tor instance 1)"
     echo -e "127.0.0.1:9060 (Tor instance 2)"
@@ -75,8 +79,17 @@ while getopts ":r:h" opt; do
     esac
 done
 
-# setup.sh runs ip-changer as a boot service; a second copy would only fight it for the ports.
-if [[ -z "${INVOCATION_ID:-}" ]] && systemctl is-active --quiet ip-changer 2>/dev/null; then
+# SOCKS on BASE, BASE+10 … BASE+40; each instance's control port is its SOCKS port + 1.
+BASE=${IPCHANGER_BASE_PORT:-9050}
+if ! [[ $BASE =~ ^[0-9]+$ ]] || ((BASE < 1024 || BASE > 65000)); then
+    echo -e "${RED}IPCHANGER_BASE_PORT=$BASE: pick a number from 1024 to 65000${RESET}" >&2
+    exit 1
+fi
+PORTS=() CONTROL_PORTS=()
+for i in {0..4}; do PORTS+=($((BASE + 10 * i))) CONTROL_PORTS+=($((BASE + 10 * i + 1))); done
+
+# setup.sh runs ip-changer as a boot service; a second copy on its ports would only fight it.
+if [[ -z "${INVOCATION_ID:-}" && $BASE = 9050 ]] && systemctl is-active --quiet ip-changer 2>/dev/null; then
     echo -e "${YELLOW}ip-changer already runs as a service. Live log: journalctl -fu ip-changer${RESET}"
     exit 0
 fi
@@ -125,9 +138,6 @@ mkdir -p "$IPCHANGER/.tor_multi"
 # Ctrl+C (or the service stopping) takes the 5 Tor instances down with it.
 trap 'kill $(jobs -p) 2>/dev/null' EXIT
 
-PORTS=(9050 9060 9070 9080 9090)
-CONTROL_PORTS=(9051 9061 9071 9081 9091)
-
 for i in {0..4}; do
     TOR_DIR="$IPCHANGER/.tor_multi/tor$i"
     mkdir -p "$TOR_DIR"
@@ -143,6 +153,8 @@ EOF
     if [[ $i -eq 0 && -n "${IPCHANGER_TRANS_PORT:-}" ]]; then
         printf 'TransPort %s IsolateDestAddr\nDNSPort %s\n' "$IPCHANGER_TRANS_PORT" "$IPCHANGER_DNS_PORT" >> "$TOR_DIR/torrc"
     fi
+    # Tor's own HTTP CONNECT proxy, for apps (Android's Wi-Fi proxy setting) that can't do SOCKS.
+    if [[ $i -eq 0 && -n "${IPCHANGER_HTTP_PORT:-}" ]]; then echo "HTTPTunnelPort $IPCHANGER_HTTP_PORT" >> "$TOR_DIR/torrc"; fi
     : > "$TOR_DIR/tor.log"
     tor -f "$TOR_DIR/torrc" > /dev/null 2>&1 &
     sleep 2
@@ -161,7 +173,7 @@ while true; do
     done
 
     # Check IP through first Tor instance
-    NEW_IP=$(curl --socks5-hostname 127.0.0.1:9050 -s --max-time 20 https://api64.ipify.org)
+    NEW_IP=$(curl --socks5-hostname "127.0.0.1:${PORTS[0]}" -s --max-time 20 https://api64.ipify.org)
     if [[ -z "$NEW_IP" ]]; then
         echo -e "${RED}[!] Failed to get new IP. Retrying...${RESET}"
         sleep 5
@@ -171,7 +183,8 @@ while true; do
     echo -e "${GREEN}New IP: $NEW_IP${RESET}"
     echo -e "${BLUE}Next IP change in $ROTATION_TIME seconds...${RESET}"
     echo -e "${CYAN}Available SOCKS5 proxies:${RESET}"
-    echo -e "127.0.0.1:9050\n127.0.0.1:9060\n127.0.0.1:9070\n127.0.0.1:9080\n127.0.0.1:9090"
+    printf '127.0.0.1:%s\n' "${PORTS[@]}"
+    if [[ -n "${IPCHANGER_HTTP_PORT:-}" ]]; then echo -e "${CYAN}HTTPS proxy:${RESET} 127.0.0.1:$IPCHANGER_HTTP_PORT"; fi
 
     sleep "$ROTATION_TIME"
 done
