@@ -129,9 +129,19 @@ async def handle(cr, cw, sites):
                 w.close()
 
 
+def ready():
+    """Tell systemd (Type=notify) the port is open: "systemctl restart" returns only then."""
+    path = os.environ.get("NOTIFY_SOCKET", "")
+    if path:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect("\0" + path[1:] if path.startswith("@") else path)
+            s.send(b"READY=1")
+
+
 async def serve(sites):
     server = await asyncio.start_server(lambda r, w: handle(r, w, sites), *LISTEN)
     print(f"hide-fast-proxy: {len(sites)} domain(s) direct, everything else through Tor", flush=True)
+    ready()
     async with server:
         await server.serve_forever()
 

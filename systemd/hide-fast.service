@@ -9,6 +9,9 @@ After=network-online.target hide.service
 User=hide-fast
 Group=hide-fast
 EnvironmentFile=/etc/hide/hide.conf
+# notify: it says when 9049 is open, so "systemctl restart" waits for it (then global-proxy's
+# check of the port, right after, finds it).
+Type=notify
 ExecStart=/usr/local/libexec/hide-fast-proxy
 Restart=always
 RestartSec=2
