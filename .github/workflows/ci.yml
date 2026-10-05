@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n + shellcheck, every shell script
+        run: |
+          mapfile -t files < <(git ls-files | while read -r f; do head -n1 "$f" | grep -qE '^#!.*bash' && echo "$f"; done)
+          printf '%s\n' "${files[@]}"
+          for f in "${files[@]}"; do bash -n "$f"; done
+          shellcheck -x -S style "${files[@]}"
+
+  # The kernel side: every global-mode and jail rule, checked by nft without loading anything.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -q nftables
+      - run: sudo bin/hide check-rules
+
+  # The package names on each family, with the obfs4 bridge program (Arch: AUR only, so not here).
+  packages:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:stable, ubuntu:24.04, fedora:latest, opensuse/tumbleweed]
+        bridges: [obfs4]
+        include:
+          - image: archlinux:latest
+            bridges: "off"
+    container: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: refresh Arch first (setup.sh asks you to)
+        if: startsWith(matrix.image, 'archlinux')
+        run: pacman -Syu --noconfirm
+      - run: bash ./setup.sh deps --bridges ${{ matrix.bridges }}
+      - name: every program hide uses is there
+        run: |
+          for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill awk; do command -v "$c"; done
+          command -v proxychains4 || command -v proxychains
+          if [ "${{ matrix.bridges }}" = obfs4 ]; then command -v lyrebird || command -v obfs4proxy; fi
+
+  # A real install on a systemd VM, global mode off (on would cut the runner off from GitHub).
+  install:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo ./setup.sh check
+      - run: sudo ./setup.sh install --global off
+      - name: wait for all 5 Tor instances
+        run: |
+          for p in 9050 9060 9070 9080 9090; do
+            for _ in $(seq 60); do
+              curl -s --max-time 20 --socks5-hostname "127.0.0.1:$p" https://check.torproject.org/api/ip | grep -q '"IsTor":true' && continue 2
+              sleep 5
+            done
+            echo "port $p: no Tor after 5 minutes"
+            sudo journalctl -u ip-changer -n 40 --no-pager
+            exit 1
+          done
+      - run: hide-test
+      - run: hide status
+      - run: sudo ./setup.sh uninstall

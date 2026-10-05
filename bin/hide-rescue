@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hide-rescue — get the internet back now, whatever state hide is in. Needs no network.
 #   hide-rescue             global mode off + its kernel rules removed + DNS reset; restarts
-#                           NetworkManager if still offline. Jailed apps stay offline (by design).
+#                           the network service if still offline. Jailed apps stay offline (by design).
 #   hide-rescue --direct    also turn the desktop/Firefox proxy off: browsers go DIRECT, not via Tor
 #   hide-rescue --in 5m     safety net before a risky change: runs by itself in 5 min
 #   hide-rescue --cancel    disarm that timer once the change works
@@ -33,7 +33,10 @@ case "${1:-}" in
 esac
 
 echo "1. global mode off (kept off after reboot)"
-if [ -f "$CONF" ]; then sed -i 's/^GLOBAL=.*/GLOBAL=off/' "$CONF"; fi
+# Delete + append: works whatever the file looks like, even missing (no GLOBAL= means on).
+mkdir -p "$(dirname "$CONF")"
+sed -i '/^GLOBAL=/d' "$CONF" 2>/dev/null
+echo GLOBAL=off >>"$CONF"
 nft delete table inet hide 2>/dev/null # the global rules, gone at once, even if hide itself is broken
 # Rebuild the jail's rules in off mode; if this fails the table just stays deleted (= direct).
 systemctl restart hide.service 2>/dev/null || echo "   (hide.service didn't restart: jailed apps stay offline, the rest is direct)"
@@ -53,8 +56,15 @@ if online; then
     echo "internet: OK"
     exit 0
 fi
-echo "still offline: restarting NetworkManager"
-systemctl restart NetworkManager 2>/dev/null
+restarted=""
+for s in NetworkManager systemd-networkd connman iwd wicked networking; do
+    if systemctl is-active --quiet "$s"; then
+        echo "still offline: restarting $s"
+        systemctl restart "$s"
+        restarted=yes
+    fi
+done
+[ -n "$restarted" ] || echo "still offline, and no network service I know of is running (NetworkManager, systemd-networkd…)"
 for _ in 1 2 3 4 5 6; do
     sleep 5
     if online; then

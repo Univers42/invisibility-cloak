@@ -6,6 +6,11 @@ DefaultDependencies=no
 Wants=network-pre.target
 Before=network-pre.target
 After=local-fs.target
+# nftables.service's "flush ruleset" would wipe hide's rules: load after it, and again whenever
+# it restarts or reloads.
+After=nftables.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
 
 [Service]
 Type=oneshot
