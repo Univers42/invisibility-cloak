@@ -38,12 +38,14 @@ dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route")
 gw=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<<"$route")
 
 # Run "<cmd…> -s --max-time 40 $CHECK"; print the Tor exit IP only if the answer is IsTor:true,
-# else print why not (never an address) and fail. A fresh circuit sometimes fails once: a
-# failed fetch gets one more try, 5 s later. An IsTor:false answer gets none (that's a leak).
+# else print why not (never an address) and fail. A circuit sometimes fails (a bad exit): a
+# failed fetch gets one more try, 5 s later, on a circuit of its own (Tor keeps using a circuit
+# for minutes, but a new SOCKS user name gets a new one; curl ignores it without a SOCKS proxy).
+# An IsTor:false answer gets none (that's a leak).
 tor_ip() {
-    local r rc try
+    local r rc try user=()
     for try in 1 2; do
-        r=$("$@" -s --max-time 40 "$CHECK" 2>/dev/null) && rc=0 || rc=$?
+        r=$("$@" -s --max-time 40 "${user[@]}" "$CHECK" 2>/dev/null) && rc=0 || rc=$?
         if [[ $r == *'"IsTor":true'* ]]; then
             r=${r#*\"IP\":\"}
             printf '%s\n' "${r%%\"*}"
@@ -51,6 +53,7 @@ tor_ip() {
         fi
         [[ $r != *'"IsTor":false'* ]] || { echo 'check.torproject.org said "IsTor":false'; return 1; }
         ((try == 2)) || sleep 5
+        user=(--proxy-user "hide-test-$RANDOM:x")
     done
     case $rc in
         0) echo "the answer wasn't check.torproject.org's" ;;
