@@ -143,6 +143,9 @@ hide bridges off
 
 If Tor won't start with the new bridges, the old setting comes back by itself. The program
 each one needs is installed by `sudo ./setup.sh install --bridges obfs4` (or `snowflake`).
+Two exceptions: Arch has them in the AUR only (`lyrebird-proxy`, `snowflake-pt-client`:
+install one with your AUR helper first), and Fedora and openSUSE have no snowflake client
+package (obfs4 works; openSUSE's `snowflake` package is the volunteer proxy, not the client).
 
 ## 🐧 Works on
 
@@ -152,10 +155,16 @@ tells you before anything gets installed.
 | Distro | Status |
 |---|---|
 | Ubuntu 24.04 (KDE desktop) | ✅ in daily use, `hide-test`: 40 passed |
-| Debian, Fedora, Arch, openSUSE, other Ubuntu releases | 🤞 should work, not tested yet |
+| Debian 13, Ubuntu 24.04, Fedora 44, Arch, openSUSE Tumbleweed | ✅ tested in containers running systemd: install, `hide-test` with global mode off and on, uninstall |
+| Debian 13, Ubuntu 24.04, Fedora 43, Arch, openSUSE Tumbleweed in LXD (unprivileged containers) | ✅ the same tests, and the jail survives systemd-networkd reloads (openSUSE doesn't run networkd) |
+| Other releases and relatives (Mint, Pop!_OS, Manjaro…) | 🤞 should work: `setup.sh check` tells you |
 | RHEL, Alma, Rocky | 🤞 needs EPEL for `tor`; setup tells you |
 | Alpine, Void, Gentoo/OpenRC, other systems without systemd | ❌ setup refuses before changing anything; use level 0 |
 | Android | 🧦 level 0 only, through Termux |
+
+The containers test the scripts and the kernel rules, not a desktop: browsers and the
+KDE/GNOME proxy settings were only tried on the Ubuntu desktop.
+On Arch the obfs4 program came from Tor's own expert bundle, standing in for the AUR package.
 
 ## 🕵️ What it hides, and what it doesn't
 
