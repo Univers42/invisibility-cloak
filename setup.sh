@@ -53,6 +53,7 @@ if [ "$CMD" = install ] || [ "$CMD" = uninstall ]; then
 fi
 
 ENGINE=ipchanger
+FAST=hide-fast
 ETC=/etc/hide
 SUDOERS=/etc/sudoers.d/hide
 FIREFOX_POLICY=/etc/firefox/policies/policies.json
@@ -68,8 +69,10 @@ FILES=(
     "bin/global-proxy /usr/local/bin/global-proxy 755"
     "bin/hide-rescue /usr/local/bin/hide-rescue 755"
     "bin/hide-jail /usr/local/libexec/hide-jail 755"
+    "bin/hide-fast-proxy /usr/local/libexec/hide-fast-proxy 755"
     "systemd/ip-changer.service /etc/systemd/system/ip-changer.service 644"
     "systemd/hide.service /etc/systemd/system/hide.service 644"
+    "systemd/hide-fast.service /etc/systemd/system/hide-fast.service 644"
     "docs/HIDE.md /usr/local/share/doc/hide/HIDE.md 644"
 )
 FIREFOX_PREFS='{
@@ -205,12 +208,13 @@ check() {
         bad=1
     fi
     ip netns del hide-check 2>/dev/null || true
-    # ip-changer's Tor: SOCKS 9050…9090, control 9051…9091, TransPort 9040, DNSPort 9053.
-    for p in 9040 9053 9050 9051 9060 9061 9070 9071 9080 9081 9090 9091; do
+    # ip-changer's Tor: SOCKS 9050…9090, control 9051…9091, TransPort 9040, DNSPort 9053;
+    # the fast-lane proxy on 9049 while it has sites.
+    for p in 9040 9053 9050 9051 9060 9061 9070 9071 9080 9081 9090 9091 $([ -z "$(conf_get FAST_SITES)" ] || echo 9049); do
         line=$(ss -Hlntup "sport = :$p" 2>/dev/null) || true
         [ -n "$line" ] || continue
         who=$(grep -o 'users:(("[^"]*' <<<"$line" | head -n1 | cut -d'"' -f2) || true
-        [ "$who" = tor ] && continue # the distro's or ip-changer's own Tor: setup stops it
+        [ "$who" = tor ] || [ "$who" = hide-fast-proxy ] && continue # ours, or the distro's Tor: setup stops it
         echo "port $p: taken by ${who:-another program}, and hide's Tor needs it. Stop or move that program (Fedora's Cockpit holds 9090: systemctl disable --now cockpit.socket)." >&2
         bad=1
     done
@@ -374,6 +378,10 @@ install_all() {
     getent passwd "$ENGINE" >/dev/null ||
         useradd --system --user-group --no-create-home --home-dir /var/lib/ip-changer \
             --shell "$(command -v nologin || echo /usr/sbin/nologin)" "$ENGINE"
+    # The fast lane's group: global mode lets it out directly while the lane is in use.
+    getent passwd "$FAST" >/dev/null ||
+        useradd --system --user-group --no-create-home --home-dir /nonexistent \
+            --shell "$(command -v nologin || echo /usr/sbin/nologin)" "$FAST"
     for f in "${FILES[@]}"; do
         read -r src dst mode <<<"$f"
         mkdirs "$(dirname "$dst")"
@@ -397,6 +405,12 @@ install_all() {
     systemctl enable --quiet hide.service ip-changer.service
     systemctl reload-or-restart hide.service
     systemctl restart ip-changer.service
+    if [ -n "$(conf_get FAST_SITES)" ]; then
+        systemctl enable --quiet hide-fast.service
+        systemctl restart hide-fast.service
+    else
+        systemctl disable --quiet --now hide-fast.service 2>/dev/null || true
+    fi
     if [ "$global" != off ]; then
         say "global mode: waiting for Tor to answer with no proxy set (up to ~4 min)"
         up=no
@@ -439,7 +453,7 @@ uninstall_all() {
     if [ -x "$HIDE" ]; then as_user "$HIDE" remove --all || true; fi
     if [ -x "$GLOBAL_PROXY" ]; then as_user "$GLOBAL_PROXY" off || true; fi
     as_user find "$USER_HOME/.config/hide" -depth -type d -empty -delete 2>/dev/null || true
-    systemctl disable --now ip-changer.service hide.service >/dev/null 2>&1 || true
+    systemctl disable --now ip-changer.service hide.service hide-fast.service >/dev/null 2>&1 || true
     if [ -x "$HIDE" ]; then "$HIDE" teardown; fi
     firewall close
     for f in "${FILES[@]}"; do
@@ -459,6 +473,8 @@ uninstall_all() {
     fi
     if getent passwd "$ENGINE" >/dev/null; then userdel "$ENGINE"; fi
     if getent group "$ENGINE" >/dev/null; then groupdel "$ENGINE"; fi
+    if getent passwd "$FAST" >/dev/null; then userdel "$FAST"; fi
+    if getent group "$FAST" >/dev/null; then groupdel "$FAST"; fi
     rm -rf /var/lib/ip-changer
     if [ -f "$ETC/reenable-tor" ]; then systemctl enable --quiet --now tor.service || true; fi
     rm -rf "$ETC"

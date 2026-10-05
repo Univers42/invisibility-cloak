@@ -3,12 +3,22 @@
 # Moves the caller into the Tor jail's network namespace, drops straight back to the
 # caller's own uid/gids, then lets `hide __enter` (as the caller) start the command.
 # Root never reads the caller's arguments or environment.
+# --fast (`hide fast run`): no namespace change, group hide-fast instead of the caller's own:
+# global mode lets that group out directly. Called from inside the jail, it stays jailed.
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ ${SUDO_UID:-} =~ ^[1-9][0-9]*$ && ${SUDO_GID:-} =~ ^[0-9]+$ ]] || {
     echo "hide-jail: use 'hide run <command>'" >&2
     exit 1
 }
+if [ "${1:-}" = --fast ] && [ $# -eq 2 ]; then
+    if [ "$(sed -n 's/^FAST_APPS=//p' /etc/hide/hide.conf | tail -n1 | tr -d '"')" != on ]; then
+        echo "hide-jail: the fast lane for apps is off — hide fast add <app> opens it" >&2
+        exit 1
+    fi
+    gid=$(getent group hide-fast | cut -d: -f3) || { echo "hide-jail: no hide-fast group — run setup.sh install again" >&2 && exit 1; }
+    exec setpriv --reuid="$SUDO_UID" --regid="$gid" --init-groups -- /usr/local/bin/hide __enter "$2"
+fi
 [ $# -eq 1 ] || exit 2
 # Refuse unless the fail-closed pieces are all in place (route guard, nft table, netns).
 if ! { [ -e /run/netns/hide ] && ip rule show | grep -q 'iif hide0 lookup 233' && nft list table inet hide >/dev/null 2>&1; }; then
