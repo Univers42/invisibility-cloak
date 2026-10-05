@@ -118,6 +118,15 @@ def dns_ok(q, r):
     rcode = r[3] & 15 if len(r) > 3 else -1  # Tor says SERVFAIL when it can not resolve through its circuit
     return "empty (%s)" % {0: "no records", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}.get(rcode, "rcode %d" % rcode)
 
+def ss(*a):
+    import subprocess
+    return subprocess.run(["ss", "-Htn", "state", "established", *a], capture_output=True, text=True).stdout.splitlines()
+def ep(s):
+    import ipaddress
+    h, p = s.rsplit(":", 1)
+    a = ipaddress.ip_address(h.strip("[]").split("%")[0])
+    return (getattr(a, "ipv4_mapped", None) or a), p
+
 cmd = sys.argv[1]
 if cmd == "stun":
     # Positive control first: a local responder proves the probe can see a reply at all.
@@ -146,13 +155,17 @@ elif cmd == "upnp":
 elif cmd == "conns":
     # Live TCP connections of your apps to the internet, each matched with its twin on the Tor
     # TransPort (global mode hands every new connection to it). Prints counts and names only.
-    import ipaddress, subprocess
-    def ss(*a):
-        return subprocess.run(["ss", "-Htn", "state", "established", *a], capture_output=True, text=True).stdout.splitlines()
-    def ep(s):
-        h, p = s.rsplit(":", 1)
-        a = ipaddress.ip_address(h.strip("[]").split("%")[0])
-        return (getattr(a, "ipv4_mapped", None) or a), p
+    # Processes in the fast lane (group argv[3]) go out directly by design: counted apart.
+    import re
+    lane = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else -1
+    def in_lane(l):
+        for pid in re.findall(r"pid=(\d+)", l):
+            try:
+                if os.stat("/proc/" + pid).st_gid == lane:
+                    return True
+            except OSError:
+                pass
+        return False
     def audit():
         twins = {ep(l.split()[3]) for l in ss("( sport = :%s )" % sys.argv[2])}
         conns = {}
@@ -160,17 +173,34 @@ elif cmd == "conns":
             f = l.split()
             names = set(l.split(chr(34))[1::2])  # users:(("name",pid=…))
             if len(f) >= 5 and names and ep(f[3])[0].is_global:
-                conns[ep(f[2])] = (names, ep(f[2]) in twins)
+                conns[ep(f[2])] = (names, ep(f[2]) in twins, in_lane(l))
         return conns
     conns = audit()
-    odd = {k for k, (_, t) in conns.items() if not t}
+    fast = {k for k, (_, t, z) in conns.items() if z and not t}
+    odd = {k for k, (_, t, _) in conns.items() if not t} - fast
     if odd:  # a connection opening or closing between the two ss reads looks twin-less once
-        import time
         time.sleep(1)
-        odd &= {k for k, (_, t) in audit().items() if not t}
-    apps = set().union(*(n for n, _ in conns.values()))
+        odd &= {k for k, (_, t, _) in audit().items() if not t}
+    apps = set().union(*(c[0] for c in conns.values()))
     bad = set().union(*(conns[k][0] for k in odd))
-    print(len(conns), len(conns) - len(odd), ",".join(sorted(bad)) or "-", ",".join(sorted(apps)) or "-")
+    print(len(conns), len(conns) - len(odd) - len(fast), len(fast), ",".join(sorted(bad)) or "-", ",".join(sorted(apps)) or "-")
+elif cmd == "lane":
+    # Hold one connection to fast site argv[2] open through the fast-lane proxy, then find the
+    # sockets of the proxy itself (uid argv[3]) to port 443: direct means no twin on the TransPort.
+    host = sys.argv[2].encode()
+    s = socket.create_connection(("127.0.0.1", 9049), timeout=30)
+    s.sendall(b"\x05\x01\x00")
+    s.recv(2)
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + (443).to_bytes(2, "big"))
+    if s.recv(10)[1:2] != b"\x00":
+        print("refused")
+        sys.exit()
+    twins = {ep(l.split()[3]) for l in ss("( sport = :%s )" % sys.argv[4])}
+    mine = [ep(l.split()[2]) for l in ss("-e", "( dport = :443 )")
+            if " uid:%s " % sys.argv[3] in l and ep(l.split()[3])[0].is_global]
+    print("tor" if any(m in twins for m in mine) else "direct" if mine else "none")
+elif cmd == "send":
+    print(udp(sys.argv[2], int(sys.argv[3]), b"hide-test"))
 elif cmd == "public":
     import ipaddress, subprocess
     out = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True).stdout
@@ -326,10 +356,12 @@ else
         r=$(probe upnp "$gw")
         if [ "$r" = "eperm eperm" ]; then ok "UPnP/NAT-PMP blocked (apps can't ask the router for your public IP)"; else bad "UPnP/NAT-PMP: $r (expected eperm eperm)"; fi
     fi
-    read -r total via odd apps <<<"$(probe conns 9040)"
+    read -r total via fast odd apps <<<"$(probe conns 9040 "$(getent group hide-fast | cut -d: -f3)")"
+    lane=""
+    [ "${fast:-0}" = 0 ] || lane=", $fast in the fast lane (direct, by your choice)"
     if [ -z "${apps:-}" ]; then bad "connection audit (ss) failed: can't judge"
-    elif [ "$total" = "$via" ]; then ok "all $total live internet connection(s) of your apps go through Tor ($apps)"
-    else meh "$((total - via)) live connection(s) don't go through Tor ($odd): opened before global mode? the firewall drops them; restart those apps"; fi
+    elif [ "$((via + fast))" = "$total" ]; then ok "$total live internet connection(s) of your apps: $via through Tor$lane ($apps)"
+    else meh "$((total - via - fast)) live connection(s) don't go through Tor ($odd): opened before global mode? the firewall drops them; restart those apps"; fi
     r=$(probe public)
     if [ "$r" = none ]; then ok "no public address on any interface for apps to read"
     elif [ -z "$r" ]; then bad "public-address probe failed: can't judge"
@@ -352,14 +384,55 @@ if [ ! -f "$f" ]; then bad "$f missing"; else
     if [ "$r" = ok ]; then ok "$f: WebRTC + proxy prefs locked"; else bad "$f: ${r:-invalid JSON}"; fi
 fi
 
+section "7. Fast lane (hide fast)"
+sites=$(conf_get FAST_SITES)
+fgid=$(getent group hide-fast | cut -d: -f3)
+if [ -z "$sites" ] && [ "$(conf_get FAST_APPS)" != on ]; then
+    skp "not in use (hide fast add youtube|<app> opens it)"
+else
+    echo "  … in use: what's in it skips Tor and shows your real IP (sites: ${sites:-none}, apps: $(conf_get FAST_APPS))"
+    if [ -z "$fgid" ]; then bad "no hide-fast group (setup.sh install not run since the update?)"; fi
+fi
+if [ -n "$sites" ]; then
+    fuid=$(id -u hide-fast 2>/dev/null)
+    if systemctl is-active --quiet hide-fast; then ok "hide-fast.service active"; else bad "hide-fast.service not active"; fi
+    if [ -n "$fuid" ] && ss -Hltne 'sport = :9049' | grep -q "uid:$fuid "; then ok "tcp 9049 listening, owned by hide-fast"; else bad "tcp 9049 not listening as hide-fast"; fi
+    if /usr/local/libexec/hide-fast-proxy --self-test >/dev/null 2>&1; then ok "hide-fast-proxy --self-test (which names may go direct)"; else bad "hide-fast-proxy --self-test failed"; fi
+    if ip=$(tor_ip curl --socks5-hostname 127.0.0.1:9049); then ok "a site not in the lane, through 9049 → Tor exit $ip"; else bad "a site not in the lane, through 9049: not through Tor ($ip)"; fi
+    if ip=$(tor_ip hide run curl --socks5-hostname 127.0.0.1:9049); then ok "the jail's 9049 leads to Tor, not the lane → Tor exit $ip"; else bad "9049 from the jail: not through Tor ($ip)"; fi
+    w=${sites%% *}
+    case $w in youtube) host=www.youtube.com ;; twitch) host=www.twitch.tv ;; *) host=$w ;; esac
+    r=$(probe lane "$host" "$fuid" 9040)
+    case $r in
+    direct) ok "$host through 9049 goes direct (no twin on Tor's TransPort)" ;;
+    tor) bad "$host through 9049 went through Tor's TransPort: the kernel rules don't exempt the lane" ;;
+    refused) bad "$host through 9049: the proxy refused the connection" ;;
+    *) bad "$host through 9049: no direct connection seen (${r:-probe failed}): the proxy fell back to Tor?" ;;
+    esac
+fi
+if [ "$(conf_get FAST_APPS)" = on ]; then
+    if [ "$global" = off ]; then skp "fast-lane apps: GLOBAL=off, apps that aren't jailed go direct anyway"
+    else
+        r=$(hide fast run python3 -c "$PROBE" send 192.0.2.1 9 2>/dev/null)
+        if [ "$r" = sent ]; then ok "fast-lane apps may send UDP (calls, games); everyone else gets EPERM"; else bad "UDP from a fast-lane app: ${r:-no output} (expected sent)"; fi
+        r=$(hide fast run python3 -c "$PROBE" dns 192.0.2.1 2>/dev/null)
+        if [ "$r" = answer ]; then ok "fast-lane apps' DNS is still answered by Tor"; else bad "DNS from a fast-lane app: ${r:-no answer} (expected Tor's answer)"; fi
+    fi
+    if ip=$(tor_ip hide run hide fast run curl); then ok "hide fast run inside the jail stays in the jail → Tor exit $ip"; else bad "hide fast run inside the jail: not through Tor ($ip)"; fi
+elif [ -n "$fgid" ]; then
+    r=$(sudo -n /usr/local/libexec/hide-jail --fast /dev/null 2>&1)
+    if [[ $r == *"lane for apps is off"* ]]; then ok "apps lane off: hide-jail --fast refuses"; else bad "hide-jail --fast with FAST_APPS=off: ${r:-no refusal}"; fi
+fi
+
 if [ "$full" = 1 ]; then
-    section "7. Fail-closed: Tor engine stopped"
+    section "8. Fail-closed: Tor engine stopped"
     if ! sudo -n true 2>/dev/null; then
         skp "needs sudo"
     else
         trap 'sudo -n systemctl start ip-changer' EXIT
         sudo -n systemctl stop ip-changer
         closed "jail" hide run curl
+        if [ -n "$sites" ]; then closed "fast-lane proxy, a site not in the lane" curl --socks5-hostname 127.0.0.1:9049; fi
         if [ "$global" = on ]; then closed "global, no proxy" curl --noproxy '*'; fi
         sudo -n systemctl start ip-changer
         trap - EXIT
