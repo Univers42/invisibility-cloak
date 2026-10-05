@@ -161,7 +161,8 @@ packages() {
     for t in "${ts[@]}"; do
         case $t in
             obfs4 | webtunnel) bins=(lyrebird obfs4proxy) pkgs=(lyrebird obfs4proxy obfs4) aur=lyrebird-proxy ;;
-            snowflake) bins=(snowflake-client snowflake-pt-client) pkgs=(snowflake-client snowflake-pt-client snowflake) aur=snowflake-pt-client ;;
+            # Not "snowflake": on openSUSE that's the volunteer proxy, which carries other people's traffic.
+            snowflake) bins=(snowflake-client snowflake-pt-client) pkgs=(snowflake-client snowflake-pt-client) aur=snowflake-pt-client ;;
             *) continue ;;
         esac
         have "${bins[@]}" && continue
