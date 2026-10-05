@@ -128,26 +128,27 @@ have() {
 packages() {
     local c absent=0 t p aur
     local -a bins pkgs ts=()
-    for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill; do have "$c" || absent=1; done
+    for c in tor nft curl nc python3 ip ss nsenter setpriv sysctl pkill awk; do have "$c" || absent=1; done
     have proxychains4 proxychains || absent=1
     if [ "$absent" = 1 ]; then
         say "installing packages"
         if have apt-get; then
             pm_install tor proxychains4 nftables curl netcat-openbsd python3 iproute2 util-linux procps
         elif have dnf; then
-            if ! pm_install tor proxychains-ng nftables curl nmap-ncat python3 iproute util-linux procps-ng; then
+            if ! pm_install tor proxychains-ng nftables curl nmap-ncat python3 iproute util-linux procps-ng gawk; then
                 grep -qi '^ID=fedora' /etc/os-release || echo "setup.sh: on RHEL, Alma or Rocky tor comes from EPEL: dnf install epel-release, then re-run" >&2
                 exit 1
             fi
         elif have pacman; then
-            if ! pm_install tor proxychains-ng nftables curl openbsd-netcat python iproute2 util-linux procps-ng; then
+            if ! pm_install tor proxychains-ng nftables curl openbsd-netcat python iproute2 util-linux procps-ng gawk; then
                 echo "setup.sh: pacman failed; an out-of-date system is the usual reason: pacman -Syu, then re-run" >&2
                 exit 1
             fi
         elif have zypper; then
-            pm_install tor proxychains-ng nftables curl netcat-openbsd python3 iproute2 util-linux procps
+            # openSUSE's minimal images have no awk at all.
+            pm_install tor proxychains-ng nftables curl netcat-openbsd python3 iproute2 util-linux procps gawk
         else
-            echo "setup.sh: no apt, dnf, pacman or zypper here: install tor, proxychains-ng, nftables, curl, netcat, python3, iproute2, util-linux and procps yourself, then re-run" >&2
+            echo "setup.sh: no apt, dnf, pacman or zypper here: install tor, proxychains-ng, nftables, curl, netcat, python3, iproute2, util-linux, procps and gawk yourself, then re-run" >&2
             exit 1
         fi
     fi
