@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""hide-fast-proxy: the fast lane for websites.
+
+A SOCKS5 proxy on 127.0.0.1:9049 that browsers use in place of Tor's 9050. A request goes
+direct (not through Tor) only when:
+  - it names a host (not an address) on port 80 or 443,
+  - the host is in FAST_SITES, by whole labels: www.youtube.com yes, evilyoutube.com no,
+  - and every address the name resolves to is public.
+Everything else is handed to Tor's SOCKS port exactly as it came, so Tor still resolves the name.
+
+FAST_SITES comes from /etc/hide/hide.conf: domains (with a dot) or the keywords below.
+  hide-fast-proxy --self-test   checks the rules above
+  hide-fast-proxy --keywords    lists the keywords
+"""
+import asyncio
+import ipaddress
+import os
+import socket
+import sys
+
+LISTEN = ("127.0.0.1", 9049)
+TOR = ("127.0.0.1", 9050)
+KEYWORDS = {
+    "youtube": "youtube.com youtu.be googlevideo.com ytimg.com ggpht.com youtube-nocookie.com",
+    "twitch": "twitch.tv ttvnw.net jtvnw.net twitchcdn.net live-video.net",
+}
+TIMEOUT = 15
+
+
+def expand(words):
+    """FAST_SITES words -> domains. A word without a dot ("com") would match a whole TLD: dropped."""
+    out = set()
+    for w in words.lower().split():
+        out.update(d.strip(".") for d in KEYWORDS.get(w, w).split())
+    return {d for d in out if "." in d}
+
+
+def is_fast(host, sites):
+    host = host.lower().rstrip(".")
+    return any(host == d or host.endswith("." + d) for d in sites)
+
+
+def all_public(addrs):
+    return bool(addrs) and all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs)
+
+
+def reply(code):
+    return bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0])
+
+
+async def handshake(r, w):
+    """The client's SOCKS5 greeting and request -> (raw request, command, host name or None, port)."""
+    ver, n = await r.readexactly(2)
+    if ver != 5:
+        raise ValueError("not SOCKS5")
+    if 0 not in await r.readexactly(n):
+        w.write(b"\x05\xff")
+        raise ValueError("the client wants a password")
+    w.write(b"\x05\x00")
+    head = await r.readexactly(4)
+    atyp, host = head[3], None
+    if atyp == 1:
+        addr = await r.readexactly(4)
+    elif atyp == 4:
+        addr = await r.readexactly(16)
+    elif atyp == 3:
+        size = await r.readexactly(1)
+        addr = size + await r.readexactly(size[0])
+        host = addr[1:].decode("latin-1")  # never fails; a non-ASCII name just matches nothing
+    else:
+        raise ValueError("bad address type")
+    port = await r.readexactly(2)
+    return head + addr + port, head[1], host, int.from_bytes(port, "big")
+
+
+async def direct(host, port):
+    """A direct connection to a fast site, or None: then the request goes to Tor instead."""
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), TIMEOUT)
+        addrs = [i[4][0] for i in infos]
+        if all_public(addrs):
+            for a in dict.fromkeys(addrs):
+                try:
+                    return await asyncio.wait_for(asyncio.open_connection(a, port), TIMEOUT)
+                except (OSError, asyncio.TimeoutError):
+                    pass
+    except (OSError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def pipe(r, w):
+    try:
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()
+    except OSError:
+        pass
+
+
+async def handle(cr, cw, sites):
+    up = None
+    try:
+        req, cmd, host, port = await asyncio.wait_for(handshake(cr, cw), TIMEOUT)
+        if cmd != 1:  # CONNECT only: no BIND, no UDP ASSOCIATE
+            cw.write(reply(7))
+            return
+        if host and port in (80, 443) and is_fast(host, sites):
+            up = await direct(host, port)
+        if up:
+            cw.write(reply(0))
+        else:
+            up = await asyncio.wait_for(asyncio.open_connection(*TOR), TIMEOUT)
+            up[1].write(b"\x05\x01\x00")
+            if await asyncio.wait_for(up[0].readexactly(2), TIMEOUT) != b"\x05\x00":
+                raise ValueError("Tor refused the greeting")
+            up[1].write(req)  # Tor answers the client itself
+        # Both ways until either side closes. Hosts are never logged: the journal would keep them.
+        tasks = [asyncio.ensure_future(pipe(cr, up[1])), asyncio.ensure_future(pipe(up[0], cw))]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in tasks:
+            t.cancel()
+    except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+        pass
+    finally:
+        for w in (cw, up and up[1]):
+            if w:
+                w.close()
+
+
+async def serve(sites):
+    server = await asyncio.start_server(lambda r, w: handle(r, w, sites), *LISTEN)
+    print(f"hide-fast-proxy: {len(sites)} domain(s) direct, everything else through Tor", flush=True)
+    async with server:
+        await server.serve_forever()
+
+
+def self_test():
+    sites = expand("youtube Example.org. com .bad.")
+    assert {"googlevideo.com", "youtu.be", "example.org"} <= sites and "com" not in sites, sites
+    for host, want in [("www.youtube.com", True), ("YouTube.com.", True), ("rr3---sn-x.googlevideo.com", True),
+                       ("example.org", True), ("evilyoutube.com", False), ("youtube.com.evil.net", False),
+                       ("org", False), ("twitch.tv", False)]:
+        assert is_fast(host, sites) == want, host
+    assert all_public(["142.250.1.1", "2a00:1450:4007::1"])
+    for bad in (["10.0.0.1"], ["142.250.1.1", "127.0.0.1"], ["100.64.0.1"], ["::1"], ["fe80::1%eth0"], []):
+        assert not all_public(bad), bad
+    print("hide-fast-proxy: self-test passed")
+
+
+def main():
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+    elif sys.argv[1:] == ["--keywords"]:
+        print(*sorted(KEYWORDS))
+    elif sys.argv[1:]:
+        sys.exit(__doc__)
+    else:
+        asyncio.run(serve(expand(os.environ.get("FAST_SITES", ""))))
+
+
+if __name__ == "__main__":
+    main()
