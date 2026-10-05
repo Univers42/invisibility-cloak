@@ -109,6 +109,10 @@ table inet hide {
 EOF
 }
 
+# Run a command in the jail's network. nsenter, not "ip netns exec" or "ip -n": those remount
+# /sys, which unprivileged containers (LXD's default) refuse.
+in_jail() { nsenter --net="/run/netns/$NS" -- "$@"; }
+
 # The jail: network namespace "hide", linked to the host by a veth pair. Idempotent.
 jail_up() {
     [ -e "/run/netns/$NS" ] || ip netns add "$NS"
@@ -117,17 +121,19 @@ jail_up() {
     ip link set "$HOST_IF" up
     # Lets the SOCKS rule in nat_pre deliver jail packets to Tor on 127.0.0.1.
     sysctl -qw "net.ipv4.conf.$HOST_IF.route_localnet=1"
-    ip -n "$NS" addr replace "$JAIL_IP/30" dev "$JAIL_IF"
-    ip -n "$NS" link set lo up
-    ip -n "$NS" link set "$JAIL_IF" up
-    ip -n "$NS" route replace default via "$HOST_IP"
+    in_jail ip addr replace "$JAIL_IP/30" dev "$JAIL_IF"
+    in_jail ip link set lo up
+    in_jail ip link set "$JAIL_IF" up
+    in_jail ip route replace default via "$HOST_IP"
     # No IPv6 in the jail (-e: a kernel booted with ipv6.disable=1 has none to switch off).
     # route_localnet lets the rules below send 127.x packets out.
-    ip netns exec "$NS" sysctl -qew net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 "net.ipv4.conf.$JAIL_IF.route_localnet=1"
-    jail_rules | ip netns exec "$NS" nft -f -
+    in_jail sysctl -qew net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 "net.ipv4.conf.$JAIL_IF.route_localnet=1"
+    jail_rules | in_jail nft -f -
     # Fail-closed even if nftables gets flushed: jail packets are never routed onward.
-    ip route replace unreachable default table "$RT_TABLE"
-    ip rule show | grep -q "iif $HOST_IF lookup $RT_TABLE" || ip rule add iif "$HOST_IF" priority 100 lookup "$RT_TABLE"
+    # "protocol kernel": systemd-networkd deletes other programs' rules and routes, but not those.
+    ip route replace unreachable default table "$RT_TABLE" protocol kernel
+    ip -d rule show | grep -q "iif $HOST_IF lookup $RT_TABLE proto kernel" ||
+        ip rule add iif "$HOST_IF" priority 100 lookup "$RT_TABLE" protocol kernel
 }
 
 # Inside the jail. A local resolver from /etc/resolv.conf (127.0.0.53, 127.0.1.1, 127.0.0.1…)

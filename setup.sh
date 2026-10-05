@@ -185,12 +185,14 @@ check() {
     done
     say "checking this machine"
     "$SRC/bin/hide" check-rules || bad=1
-    if ip netns add hide-check 2>/dev/null && ip netns del hide-check; then
+    # The jail's way in: a namespace, entered with nsenter.
+    if ip netns add hide-check 2>/dev/null && nsenter --net=/run/netns/hide-check -- true 2>/dev/null; then
         echo "jail: network namespaces work."
     else
-        echo "jail: this machine can't create a network namespace." >&2
+        echo "jail: this machine can't create or enter a network namespace." >&2
         bad=1
     fi
+    ip netns del hide-check 2>/dev/null || true
     # ip-changer's Tor: SOCKS 9050…9090, control 9051…9091, TransPort 9040, DNSPort 9053.
     for p in 9040 9053 9050 9051 9060 9061 9070 9071 9080 9081 9090 9091; do
         line=$(ss -Hlntup "sport = :$p" 2>/dev/null) || true
