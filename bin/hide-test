@@ -25,6 +25,11 @@ for a in "$@"; do
     esac
 done
 
+if ! systemctl is-enabled --quiet hide.service 2>/dev/null; then
+    echo "hide-test: hide is off (hide off), so there is nothing to test. First: hide on" >&2
+    exit 1
+fi
+
 pass=0 fail=0 warn=0 skip=0
 ok() { pass=$((pass + 1)) && printf '  \e[32mPASS\e[0m %s\n' "$*"; }
 bad() { fail=$((fail + 1)) && printf '  \e[31mFAIL\e[0m %s\n' "$*"; }

@@ -22,7 +22,7 @@ fi
 [ $# -eq 1 ] || exit 2
 # Refuse unless the fail-closed pieces are all in place (route guard, nft table, netns).
 if ! { [ -e /run/netns/hide ] && ip rule show | grep -q 'iif hide0 lookup 233' && nft list table inet hide >/dev/null 2>&1; }; then
-    echo "hide-jail: the Tor jail is down — sudo systemctl restart hide" >&2
+    echo "hide-jail: the Tor jail is down — hide on (already on? sudo systemctl restart hide)" >&2
     exit 1
 fi
 exec nsenter --net=/run/netns/hide -- setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- /usr/local/bin/hide __enter "$1"

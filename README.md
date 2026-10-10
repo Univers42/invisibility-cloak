@@ -95,6 +95,7 @@ watches the exit change. `hide-test --full` stops Tor and checks that everything
 | Command | What it does |
 |---|---|
 | `hide` | what's on, and whether Tor answers |
+| `hide off` / `hide on` | stop all of it (Tor, rules, browser proxy): your real IP at full speed, also after a reboot / everything back as it was |
 | `hide global on` / `off` | the whole machine through Tor, or back to normal |
 | `hide run firefox` | run one command inside the Tor jail |
 | `hide add` / `hide add discord` | list your apps / make one always start in the jail |

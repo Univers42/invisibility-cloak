@@ -31,6 +31,8 @@ never overwritten by a re-install):
 | Command | What it does |
 |---|---|
 | `hide` / `hide status` | engine, bridges, rules, global mode, current Tor exit, jailed apps. In global mode it sends a real request with no proxy, so it notices when the rules are gone even though the config says on |
+| `hide off` | stop it all, until `hide on` (a reboot keeps it off): the engine and hide-dns, the rules and jail, the fast lane, and the desktop/Firefox proxy (restart Firefox). Everything goes direct, with your real IP; jailed apps won't start. `hide.conf` is untouched, and `hide global`, `hide fast` and `hide bridges` only edit it until then (asks for sudo) |
+| `hide on` | everything back as `hide.conf` says, the browser proxy too if `hide off` turned it off. In global mode the machine is offline until Tor connects (seconds; minutes with bridges); `hide off` again needs no network |
 | `hide global on\|off` | switch global mode (asks for sudo, takes effect at once) |
 | `hide bridges snowflake\|obfs4\|FILE\|off` | switch bridges and restart the engine. If Tor won't start with them, the old setting comes back |
 | `hide run <cmd> [args…]` | run one command inside the Tor jail, as you |
