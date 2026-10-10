@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # hide — keep apps, or the whole machine, off your real IP via ip-changer's Tor.
 #   hide [status]                what is on, and whether Tor answers
-#   hide global on|off           every app, user and container through Tor (asks for sudo)
+#   hide off|on                  stop it all (Tor, rules, browser proxy: real IP, full speed) / back
+#   hide global on|off          every app, user and container through Tor (asks for sudo)
 #   hide run <cmd> [args…]       run one command inside the Tor jail
 #   hide add [<app>]             make an app's launcher always start in the jail (no arg: list)
 #   hide remove <app>|--all      undo `hide add`
@@ -38,6 +39,9 @@ die() {
 
 conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n1 | tr -d '"'; }
 conf_set() { if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=$2|" "$CONF"; else echo "$1=$2" >>"$CONF"; fi; }
+
+# `hide off` disables hide.service (so it stays off after a reboot); setup.sh install enables it.
+paused() { ! systemctl is-enabled --quiet hide.service 2>/dev/null; }
 
 # Anything but an explicit "off" means on: a typo must not open the machine up.
 global_mode() { if [ "$(conf_get GLOBAL)" = off ]; then echo off; else echo on; fi; }
@@ -205,8 +209,54 @@ global() {
     case "${1:-}" in on | off) ;; *) die "usage: hide global on|off" ;; esac
     [ "$(id -u)" -eq 0 ] || exec sudo "$(readlink -f "$0")" global "$1"
     conf_set GLOBAL "$1"
+    # While off, restarting the rules without Tor would cut the machine off.
+    if paused; then echo "global mode $1, from the next: hide on" && return; fi
     systemctl reload-or-restart hide.service
     echo "global mode $1."
+}
+
+# hide off|on, root part. hide.conf is left alone, so "on" brings back what it says.
+power_root() { # on|off
+    [ "$(id -u)" -eq 0 ] || die "__power needs root"
+    case "${1:-}" in
+        off)
+            # hide-dns stops with the engine (PartOf=); hide.service's stop removes the rules and jail.
+            systemctl disable --quiet --now hide-fast.service ip-changer.service hide.service
+            # resolved may have downgraded the DNS server while it sat behind Tor.
+            resolvectl flush-caches 2>/dev/null || true
+            resolvectl reset-server-features 2>/dev/null || true
+            ;;
+        on)
+            systemctl enable --quiet --now hide.service ip-changer.service
+            if [ -n "$(conf_get FAST_SITES)" ]; then systemctl enable --quiet --now hide-fast.service; fi
+            # global-proxy, next, warns while nothing listens on 9050: Tor opens it within seconds.
+            for _ in $(seq 15); do
+                [ -z "$(ss -ltnH 'sport = :9050')" ] || break
+                sleep 1
+            done
+            ;;
+        *) die "usage: hide __power on|off" ;;
+    esac
+}
+
+# hide off: Tor, the kernel rules, DNS, the fast lane and the browser proxy all stop, until
+# hide on (a reboot keeps it off). The browser proxy has to go too: it points at Tor, fail-closed.
+power() { # on|off
+    local mark="$STATE/proxy-paused"
+    case "${1:-}" in on | off) ;; *) die "usage: hide on|off" ;; esac
+    [ "$(id -u)" -ne 0 ] || die "run hide $1 as yourself, not with sudo: it switches your desktop proxy settings too"
+    sudo "$(readlink -f "$0")" __power "$1"
+    if [ "$1" = off ]; then
+        if [ -d "$STATE/proxy-before" ] && [ -x "$GLOBAL_PROXY" ]; then
+            if "$GLOBAL_PROXY" off; then touch "$mark"; else echo "hide: global-proxy off failed: run it yourself" >&2; fi
+        fi
+        echo "hide is OFF: no Tor, everything goes direct with your real IP. Back on: hide on"
+    else
+        if [ -e "$mark" ] && [ -x "$GLOBAL_PROXY" ]; then
+            if "$GLOBAL_PROXY" on; then rm -f "$mark"; else echo "hide: global-proxy on failed: run it yourself" >&2; fi
+        fi
+        echo "hide is ON, global mode $(global_mode). Tor is connecting (seconds; minutes with bridges). Check: hide status"
+    fi
 }
 
 # Bridges for networks that block Tor. A file of your own lines is copied to /etc/hide: the
@@ -229,6 +279,7 @@ bridges() {
         /*) install -m 644 "$v" /etc/hide/bridges.txt && v=/etc/hide/bridges.txt ;;
     esac
     conf_set BRIDGES "\"$v\""
+    if paused; then echo "bridges: ${v:-off}, from the next: hide on" && return; fi
     systemctl restart ip-changer.service
     # A bad bridge setup makes the engine exit within seconds; systemd then restarts it in a loop.
     n=$(systemctl show -p NRestarts --value ip-changer.service)
@@ -444,6 +495,10 @@ remove() { # <app>|--all [fast]
 
 status() {
     local ip f r g b
+    if paused; then
+        echo "hide is OFF (hide off): no Tor, everything goes direct with your real IP. Back on: hide on"
+        return
+    fi
     b=$(conf_get BRIDGES)
     echo "engine : ip-changer.service $(systemctl is-active ip-changer 2>/dev/null), bridges ${b:-off}"
     # Global mode as the kernel does it, not as hide.conf says: a direct request must come out of Tor.
@@ -485,6 +540,7 @@ fast_root() { # <sites> on|off
     case "${2:-}" in on | off) ;; *) die "usage: hide __fast <sites> on|off" ;; esac
     conf_set FAST_SITES "\"${words[*]}\""
     conf_set FAST_APPS "$2"
+    if paused; then return; fi # hide on starts what hide.conf now says
     systemctl reload-or-restart hide.service
     if [ ${#words[@]} -gt 0 ]; then
         systemctl enable --quiet hide-fast.service
@@ -575,6 +631,7 @@ fast() {
 
 case "${1:-status}" in
 status) status ;;
+off | on) power "$1" ;;
 global) global "${2:-}" ;;
 run) shift && run_in jail "$@" ;;
 fast) shift && fast "$@" ;;
@@ -586,8 +643,9 @@ apply) apply ;;
 teardown) teardown ;;
 __enter) enter "$2" ;;
 __fast) fast_root "${2:-}" "${3:-}" ;;
+__power) power_root "${2:-}" ;;
 *)
-    sed -n '2,13s/^# \{0,1\}//p' "$0" >&2
+    sed -n '2,14s/^# \{0,1\}//p' "$0" >&2
     exit 2
     ;;
 esac

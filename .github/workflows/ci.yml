@@ -84,6 +84,20 @@ jobs:
           hide fast
           hide-test
           hide fast off
+      - name: hide off stops it all, hide on brings it back
+        run: |
+          hide off
+          for u in hide ip-changer hide-dns hide-fast; do if systemctl is-active --quiet "$u"; then echo "$u still runs"; exit 1; fi; done
+          if sudo nft list table inet hide >/dev/null 2>&1; then echo "rules left behind"; exit 1; fi
+          if [ -d ~/.config/hide/proxy-before ]; then echo "browser proxy still on"; exit 1; fi
+          hide status | grep -q OFF
+          hide on
+          [ -d ~/.config/hide/proxy-before ] || { echo "browser proxy not back"; exit 1; }
+          for _ in $(seq 60); do
+            curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '"IsTor":true' && break
+            sleep 5
+          done
+          hide-test
       - run: sudo ./setup.sh uninstall
       - name: nothing left behind
         run: |
