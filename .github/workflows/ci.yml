@@ -93,9 +93,14 @@ jobs:
           hide status | grep -q OFF
           hide on
           [ -d ~/.config/hide/proxy-before ] || { echo "browser proxy not back"; exit 1; }
-          for _ in $(seq 60); do
-            curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '"IsTor":true' && break
-            sleep 5
+          # The engine starts its 5 Tors 2 s apart: hide-test right away finds the last ports closed.
+          for p in 9050 9060 9070 9080 9090; do
+            for _ in $(seq 60); do
+              curl -s --max-time 20 --socks5-hostname "127.0.0.1:$p" https://check.torproject.org/api/ip | grep -q '"IsTor":true' && continue 2
+              sleep 5
+            done
+            echo "port $p: no Tor 5 minutes after hide on"
+            exit 1
           done
           hide-test
       - run: sudo ./setup.sh uninstall
