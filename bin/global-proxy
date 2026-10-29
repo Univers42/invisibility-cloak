@@ -2,13 +2,17 @@
 # global-proxy on|off — point the desktop proxy settings (KDE, GNOME) and Firefox at
 # ip-changer's Tor SOCKS ports (127.0.0.1:9050-9090). This covers proxy-aware apps
 # when hide's GLOBAL=off; with GLOBAL=on the kernel already forces everything into Tor.
+# While hide's fast lane has sites (hide-fast.service enabled), they point at its proxy on
+# 9049 instead: the sites in it go direct, it hands everything else to Tor.
 # Fail-closed: while on, nothing falls back to your real IP. "off" restores what was
 # set before the first "on". Firefox only reads proxy settings at startup: restart it.
 set -euo pipefail
 
 BEGIN='// >>> global-proxy: Tor >>>'
 END='// <<< global-proxy: Tor <<<'
-SOCKS='socks://127.0.0.1 9050'
+PORT=9050 CHAIN="SOCKS5 127.0.0.1:9050; SOCKS5 127.0.0.1:9060; SOCKS5 127.0.0.1:9070; SOCKS5 127.0.0.1:9080; SOCKS5 127.0.0.1:9090"
+if systemctl is-enabled --quiet hide-fast 2>/dev/null; then PORT=9049 CHAIN="SOCKS5 127.0.0.1:9049; $CHAIN"; fi
+SOCKS="socks://127.0.0.1 $PORT"
 SAVED="${XDG_CONFIG_HOME:-$HOME/.config}/hide/proxy-before"
 KWRITE=$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)
 KREAD=$(command -v kreadconfig6 || command -v kreadconfig5 || true)
@@ -21,12 +25,15 @@ remember() {
 }
 recall() { cat "$SAVED/$1"; }
 
+# Is this KDE socksProxy value one we write (Tor, or the fast lane's proxy)?
+ours() { [ "$1" = 'socks://127.0.0.1 9050' ] || [ "$1" = 'socks://127.0.0.1 9049' ]; }
+
 kde() {
     { [ -n "$KWRITE" ] && [ -n "$KREAD" ]; } || return 0
     local g=(--file kioslaverc --group 'Proxy Settings') k
     SET="$SET KDE"
     if [ "$1" = on ]; then
-        if [ "$("$KREAD" "${g[@]}" --key socksProxy)" != "$SOCKS" ]; then
+        if ! ours "$("$KREAD" "${g[@]}" --key socksProxy)"; then
             for k in ProxyType socksProxy; do remember "kde.$k" "$("$KREAD" "${g[@]}" --key "$k")"; done
         fi
         "$KWRITE" "${g[@]}" --key ProxyType 1
@@ -35,7 +42,7 @@ kde() {
         for k in ProxyType socksProxy; do
             if [ -n "$(recall "kde.$k")" ]; then "$KWRITE" "${g[@]}" --key "$k" "$(recall "kde.$k")"; else "$KWRITE" "${g[@]}" --key "$k" --delete; fi
         done
-    elif [ "$("$KREAD" "${g[@]}" --key socksProxy)" = "$SOCKS" ]; then
+    elif ours "$("$KREAD" "${g[@]}" --key socksProxy)"; then
         "$KWRITE" "${g[@]}" --key ProxyType 0 # set by an older global-proxy that saved nothing
     fi
     # Running KDE apps re-read it on this signal; Chrome watches the file itself.
@@ -46,23 +53,22 @@ gnome() {
     gsettings get org.gnome.system.proxy.socks host >/dev/null 2>&1 || return 0
     local p=org.gnome.system.proxy
     SET="$SET GNOME"
-    local ours="'manual' '127.0.0.1' 9050"
     local now
     now="$(gsettings get $p mode) $(gsettings get $p.socks host) $(gsettings get $p.socks port)"
     if [ "$1" = on ]; then
-        if [ "$now" != "$ours" ]; then
+        if [ "$now" != "'manual' '127.0.0.1' 9050" ] && [ "$now" != "'manual' '127.0.0.1' 9049" ]; then
             remember gnome.mode "$(gsettings get $p mode)"
             remember gnome.host "$(gsettings get $p.socks host)"
             remember gnome.port "$(gsettings get $p.socks port)"
         fi
         gsettings set $p.socks host 127.0.0.1
-        gsettings set $p.socks port 9050
+        gsettings set $p.socks port $PORT
         gsettings set $p mode manual
     elif [ -e "$SAVED/gnome.mode" ]; then
         gsettings set $p.socks host "$(recall gnome.host)"
         gsettings set $p.socks port "$(recall gnome.port)"
         gsettings set $p mode "$(recall gnome.mode)"
-    elif [ "$now" = "$ours" ]; then
+    elif [ "$now" = "'manual' '127.0.0.1' 9050" ] || [ "$now" = "'manual' '127.0.0.1' 9049" ]; then
         gsettings set $p mode none
     fi
 }
@@ -92,8 +98,8 @@ write_block() {
 
 pref_line() { grep -E "^user_pref\(\"network\.proxy\.$1\"," | tail -n1; }
 
-# Every site goes to Tor, except those the PAC you used before sent to a proxy on this
-# machine (say, a local dev site behind a proxy on 127.0.0.1:8118).
+# Every site goes to Tor (to the fast lane's proxy first while it has sites), except those the
+# PAC you used before sent to a proxy on this machine (say, a local dev site on 127.0.0.1:8118).
 write_pac() {
     local p=$1 prev
     prev=$({ block_lines "$p/user.js" 0; cat "$p/global-proxy.before" 2>/dev/null; } | pref_line autoconfig_url | sed -n 's|.*"file://\([^"]*\)".*|\1|p') || true
@@ -103,9 +109,8 @@ function FindProxyForURL(url, host) {
     var before = String(previousFindProxyForURL(url, host)).split(";")[0].trim();
     if (/^PROXY (127\.|localhost:|\[::1\]:)/.test(before))
         return before;
-    return "SOCKS5 127.0.0.1:9050; SOCKS5 127.0.0.1:9060; SOCKS5 127.0.0.1:9070; SOCKS5 127.0.0.1:9080; SOCKS5 127.0.0.1:9090";
-}
 EOF
+        printf '    return "%s";\n}\n' "$CHAIN"
         if [ -n "$prev" ] && [ "$prev" != "$p/tor.pac" ] && [ -f "$prev" ]; then
             sed 's/\bFindProxyForURL\b/previousFindProxyForURL/g' "$prev"
         else
@@ -150,12 +155,14 @@ firefox() {
 
 case "${1:-}" in
 on)
+    mkdir -p "$SAVED" # also tells hide fast that the proxy settings are on
     kde on
     gnome on
     firefox on
-    if [ -z "$(ss -ltnH 'sport = :9050')" ]; then
-        echo "warning: Tor isn't listening on 9050 — start ip-changer, or nothing will load (fail-closed)." >&2
+    if [ -z "$(ss -ltnH "sport = :$PORT")" ]; then
+        echo "warning: nothing listens on $PORT — start ip-changer (and hide-fast), or nothing will load (fail-closed)." >&2
     fi
+    if [ "$PORT" = 9049 ]; then echo "fast lane: through 127.0.0.1:9049, its sites go direct and the rest to Tor."; fi
     if [ -n "$SET" ]; then
         echo "global proxy ON:${SET} apps + Chrome now, Firefox after a restart."
     else

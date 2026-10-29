@@ -1,0 +1,20 @@
+[Unit]
+Description=hide DNS: 0.0.0.0:9053 to Tor, a second exit asked when the first says "no such name"
+Documentation=file:///usr/local/share/doc/hide/HIDE.md
+# Started with the engine (its Wants=), stopped and restarted with it.
+PartOf=ip-changer.service
+After=ip-changer.service
+
+[Service]
+# A user systemd makes up for it, not the engine's: global mode doesn't let it out, and it
+# needs nothing but Tor on 127.0.0.1.
+DynamicUser=yes
+# notify: it says when 9053 is open, so "systemctl restart" waits for it.
+Type=notify
+ExecStart=/usr/local/libexec/hide-dns
+Restart=always
+RestartSec=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

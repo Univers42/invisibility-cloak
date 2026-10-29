@@ -14,6 +14,13 @@ jobs:
           printf '%s\n' "${files[@]}"
           for f in "${files[@]}"; do bash -n "$f"; done
           shellcheck -x -S style "${files[@]}"
+      - name: python syntax, and the self-tests of the fast-lane proxy and hide-dns
+        run: |
+          mapfile -t py < <(git ls-files | while read -r f; do head -n1 "$f" | grep -qE '^#!.*python' && echo "$f"; done)
+          printf '%s\n' "${py[@]}"
+          for f in "${py[@]}"; do python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"; done
+          bin/hide-fast-proxy --self-test
+          bin/hide-dns --self-test
 
   # The kernel side: every global-mode and jail rule, checked by nft without loading anything.
   rules:
@@ -70,4 +77,34 @@ jobs:
           done
       - run: hide-test
       - run: hide status
+      - name: the fast lane, sites and apps, then closed again
+        run: |
+          hide fast add youtube
+          hide fast run true
+          hide fast
+          hide-test
+          hide fast off
+      - name: hide off stops it all, hide on brings it back
+        run: |
+          hide off
+          for u in hide ip-changer hide-dns hide-fast; do if systemctl is-active --quiet "$u"; then echo "$u still runs"; exit 1; fi; done
+          if sudo nft list table inet hide >/dev/null 2>&1; then echo "rules left behind"; exit 1; fi
+          if [ -d ~/.config/hide/proxy-before ]; then echo "browser proxy still on"; exit 1; fi
+          hide status | grep -q OFF
+          hide on
+          [ -d ~/.config/hide/proxy-before ] || { echo "browser proxy not back"; exit 1; }
+          # The engine starts its 5 Tors 2 s apart: hide-test right away finds the last ports closed.
+          for p in 9050 9060 9070 9080 9090; do
+            for _ in $(seq 60); do
+              curl -s --max-time 20 --socks5-hostname "127.0.0.1:$p" https://check.torproject.org/api/ip | grep -q '"IsTor":true' && continue 2
+              sleep 5
+            done
+            echo "port $p: no Tor 5 minutes after hide on"
+            exit 1
+          done
+          hide-test
       - run: sudo ./setup.sh uninstall
+      - name: nothing left behind
+        run: |
+          for u in ipchanger hide-fast; do if getent passwd "$u"; then echo "user $u left behind"; exit 1; fi; done
+          if systemctl cat hide-fast.service >/dev/null 2>&1; then echo "hide-fast.service left behind"; exit 1; fi

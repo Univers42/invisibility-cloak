@@ -1,0 +1,174 @@
+#!/usr/bin/python3
+"""hide-dns: global mode's DNS, with a second opinion.
+
+Tor's DNSPort passes on what the exit says, and some exits are wrong: one in forty said
+github.com doesn't exist. Every lookup then fails the same way until Tor changes circuits
+(ROTATE seconds later), and a "git clone --recursive" loses half its submodules.
+
+hide-dns takes the DNS that global mode, the jail and containers send to 0.0.0.0:9053 and
+asks Tor's first DNSPort (127.0.0.1:9054). When that answer is "no such name", a failure, or
+slow, it also asks the second one (127.0.0.1:9055): Tor keeps the two ports on separate
+circuits, so a different exit. The first good answer wins; "no such name" stands only when
+both exits say it. Answers are passed on byte for byte, and names are never logged.
+  hide-dns --self-test   checks all of the above against two fake DNSPorts
+"""
+import asyncio
+import os
+import socket
+import sys
+
+LISTEN = ("0.0.0.0", 9053)
+TOR = [("127.0.0.1", 9054), ("127.0.0.1", 9055)]
+SLOW = 3  # seconds before the second exit is asked as well
+GIVE_UP = 10  # per exit; the asker has retried by then (glibc waits 5 s)
+MAX_BUSY = 512  # questions in flight; more are dropped, and their askers retry
+SERVFAIL, NXDOMAIN, REFUSED = 2, 3, 5
+
+
+def rcode(p):
+    return p[3] & 15
+
+
+def bad(p):
+    """No answer, a server failure, no such name, refused: worth asking another exit."""
+    return p is None or rcode(p) in (SERVFAIL, NXDOMAIN, REFUSED)
+
+
+def pick(answers):
+    """When no answer was good: a failure (the asker retries) over "no such name" (it would be
+    cached), which is passed on only when nothing else came back. None: send nothing."""
+    got = [p for p in answers if p is not None]
+    return ([p for p in got if rcode(p) != NXDOMAIN] or got or [None])[0]
+
+
+async def ask(addr, q):
+    """One DNSPort's answer to q, or None."""
+    loop = asyncio.get_running_loop()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setblocking(False)
+        try:
+            s.connect(addr)
+            await loop.sock_sendall(s, q)
+            p = await asyncio.wait_for(loop.sock_recv(s, 65535), GIVE_UP)
+            return p if len(p) >= 12 and p[:2] == q[:2] else None
+        except (OSError, asyncio.TimeoutError):
+            return None
+
+
+async def resolve(q):
+    tasks = [asyncio.ensure_future(ask(TOR[0], q))]
+    done, _ = await asyncio.wait(tasks, timeout=SLOW)
+    if not done or bad(tasks[0].result()):
+        tasks.append(asyncio.ensure_future(ask(TOR[1], q)))
+    try:
+        for t in asyncio.as_completed(tasks):
+            p = await t
+            if not bad(p):
+                return p
+    finally:
+        for t in tasks:
+            t.cancel()
+    return pick([t.result() for t in tasks])
+
+
+class Server(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.busy = set()  # also keeps the tasks alive: asyncio only holds weak references
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, q, addr):
+        if len(q) < 12 or q[2] & 0x80 or len(self.busy) >= MAX_BUSY:
+            return  # too short, an answer rather than a question, or too many at once
+        t = asyncio.ensure_future(self.answer(q, addr))
+        self.busy.add(t)
+        t.add_done_callback(self.busy.discard)
+
+    async def answer(self, q, addr):
+        p = await resolve(q)
+        if p is not None:
+            self.transport.sendto(p, addr)
+
+
+def ready():
+    """Tell systemd (Type=notify) the port is open: "systemctl restart" returns only then."""
+    path = os.environ.get("NOTIFY_SOCKET", "")
+    if path:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect("\0" + path[1:] if path.startswith("@") else path)
+            s.send(b"READY=1")
+
+
+async def serve():
+    await asyncio.get_running_loop().create_datagram_endpoint(Server, local_addr=LISTEN)
+    print("hide-dns: %s:%d, asking Tor on %d, then %d" % (*LISTEN, TOR[0][1], TOR[1][1]), flush=True)
+    ready()
+    await asyncio.Event().wait()
+
+
+class Fake(asyncio.DatagramProtocol):
+    """A DNSPort for the self-test: answers every question with one rcode (None: silent)."""
+
+    def __init__(self, code):
+        self.code, self.asked = code, 0
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, q, addr):
+        self.asked += 1
+        if self.code is not None:
+            self.transport.sendto(q[:2] + bytes([0x81, 0x80 | self.code]) + q[4:], addr)
+
+
+async def run_checks():
+    global TOR, SLOW, GIVE_UP
+    SLOW, GIVE_UP = 0.2, 0.5
+    loop = asyncio.get_running_loop()
+    q = b"\x12\x34\x01\x00\x00\x01" + bytes(6) + b"\x06github\x03com\x00\x00\x01\x00\x01"
+    for first, second, want, both in [(0, 0, 0, False), (4, 0, 4, False), (NXDOMAIN, 0, 0, True),
+                                      (SERVFAIL, 0, 0, True), (None, 0, 0, True),
+                                      (NXDOMAIN, NXDOMAIN, NXDOMAIN, True), (NXDOMAIN, SERVFAIL, SERVFAIL, True),
+                                      (None, NXDOMAIN, NXDOMAIN, True), (None, None, None, True)]:
+        fakes = [Fake(first), Fake(second)]
+        ends = [(await loop.create_datagram_endpoint(lambda f=f: f, local_addr=("127.0.0.1", 0)))[0] for f in fakes]
+        TOR = [e.get_extra_info("sockname") for e in ends]
+        p = await resolve(q)
+        got = None if p is None else rcode(p)
+        assert got == want and fakes[1].asked == both, (first, second, got, fakes[1].asked)
+        for e in ends:
+            e.close()
+    # The whole way: a question to the server comes back with Tor's answer; an answer is ignored.
+    fake = Fake(0)
+    tor = (await loop.create_datagram_endpoint(lambda: fake, local_addr=("127.0.0.1", 0)))[0]
+    TOR = [tor.get_extra_info("sockname")] * 2
+    srv = (await loop.create_datagram_endpoint(Server, local_addr=("127.0.0.1", 0)))[0]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+        c.setblocking(False)
+        c.connect(srv.get_extra_info("sockname"))
+        await loop.sock_sendall(c, q[:2] + b"\x81\x80" + q[4:])
+        await loop.sock_sendall(c, q)
+        p = await asyncio.wait_for(loop.sock_recv(c, 512), 2)
+    assert p == q[:2] + b"\x81\x80" + q[4:] and fake.asked == 1, (p, fake.asked)
+    srv.close()
+    tor.close()
+
+
+def self_test():
+    assert pick([None, None]) is None and pick([]) is None
+    asyncio.run(run_checks())
+    print("hide-dns: self-test passed")
+
+
+def main():
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+    elif sys.argv[1:]:
+        sys.exit(__doc__)
+    else:
+        asyncio.run(serve())
+
+
+if __name__ == "__main__":
+    main()
